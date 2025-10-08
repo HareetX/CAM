@@ -1,6 +1,6 @@
 # Constructivist Agentic Memory
 
-<img src="./cam_perspective.png" width="55%" alt="CAM Overview"/>
+<img src="./image/cam_perspective.png" width="55%" alt="CAM Overview"/>
 
 [📄 [Paper](https://arxiv.org/abs/2510.05520)] _CAM: A Constructivist View of Agentic Memory for LLM-Based Reading Comprehension_
 
