@@ -1,0 +1,166 @@
+import os
+import pickle
+from tqdm import tqdm
+import argparse
+from tasks.tools.utils import count_tokens
+import json
+
+
+
+def find_punctuations(text, comma=False):
+    """Find punctuation indices in the text, optionally including commas."""
+    if comma:
+        puncs = ['.', '?', '!', ',', '."', '?"', '!"', ".'", "?'", "!'"]
+    else:
+        puncs = ['.', '?', '!', '."', '?"', '!"', ".'", "?'", "!'"]
+    
+    puncs_idx = []
+    for i, c in enumerate(text):
+        if c in puncs:
+            puncs_idx.append(i)
+        elif c == '"' or c == "'":
+            if i > 0 and text[i-1] in ['.', '?', '!']:
+                puncs_idx.append(i)
+    
+    return puncs_idx
+
+
+def truncate(text, chunk_size):
+    """Truncate text at safe punctuation boundaries so token count fits within chunk size."""
+    ori_text = text
+    ori_len = len(text)
+    
+    while count_tokens(text) > chunk_size:
+        puncs_idx = find_punctuations(text)
+        try:
+            text = text[:puncs_idx[-2] + 1]
+        except:
+            puncs_idx = find_punctuations(text, comma=True)
+            try:
+                text = text[:puncs_idx[-2] + 1]
+            except:
+                assert (ori_len - len(text)) == 0, f"Text truncation failed: {(ori_len - len(text))} characters of remaining 'truncated' part were discarded."
+                return text, ''
+    
+    # new_len = len(text)
+    # diff = ori_len - new_len
+    truncated = ori_text[len(text):]
+    
+    return text, truncated
+
+
+def chunk_text(paragraphs, chunk_size):
+    """Split paragraphs into token-constrained chunks."""
+    chunks = []
+    curr_chunk = ''
+
+    for p in tqdm(paragraphs, total=len(paragraphs)):
+        new_chunk = '\n'.join([curr_chunk, p]) if len(curr_chunk) > 0 else p
+
+        # if a single paragraph is too long, split it into smaller chunks
+        if count_tokens(p) > chunk_size:
+            curr_chunk, chunk_truncated = truncate(new_chunk, chunk_size)
+            chunks.append(curr_chunk)
+            while count_tokens(chunk_truncated) > chunk_size:
+                curr_chunk, chunk_truncated = truncate(chunk_truncated, chunk_size)
+                chunks.append(curr_chunk)
+            curr_chunk = chunk_truncated
+            continue
+        
+        if count_tokens(new_chunk) > chunk_size:
+            chunks.append(curr_chunk)
+            curr_chunk = p
+        else:
+            curr_chunk = new_chunk
+
+    if len(curr_chunk) > 0:
+        chunks.append(curr_chunk)
+
+    return chunks
+
+
+def process_book(title, book, chunk_size, include_empty):
+    """Process a long doc into token-constrained chunks."""
+    new_data = {}
+    paragraphs = book.split("\n")
+    index_id = 0
+    if not include_empty:
+        paragraphs = [p for p in paragraphs if len(p) > 0]
+
+    total_size = count_tokens('\n'.join(paragraphs))
+    print(f"{title} total sizes: {total_size}")
+
+    if total_size <= chunk_size:
+        new_data[str(index_id)] = {}
+        new_data[str(index_id)]["title"] = f"{title}_chunk_0"
+        new_data[str(index_id)]["text"] = '\n'.join(paragraphs)
+    else:
+        chunks = chunk_text(paragraphs, chunk_size)
+        len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
+        assert len_diff == 0, f"Information lost: {len_diff}"
+
+        for chunk_id, chunk in enumerate(chunks):
+            new_data[str(index_id)] = {}
+            new_data[str(index_id)]["title"] = f"{title}_chunk_{chunk_id}"
+            new_data[str(index_id)]["text"] = chunk
+            index_id += 1
+            
+        chunk_sizes = [count_tokens(new_data[c]["text"]) for c in new_data.keys()]
+        print(f"{title} chunk num: {len(chunk_sizes)}")
+        print(f"{title} chunk sizes: {chunk_sizes}")
+    return new_data
+
+
+def main(args):
+    input_dir = f'./data/{args.dataset}/books/'
+    output_dir = f'./data/{args.dataset}/chunks/'
+    os.makedirs(output_dir, exist_ok=True)
+
+    merged_chunks = {}
+    global_chunk_id = 0
+
+    for filename in os.listdir(input_dir):
+        if not filename.endswith('.txt'):
+            continue
+
+        file_path = os.path.join(input_dir, filename)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            book = f.read()
+
+        title = os.path.splitext(filename)[0]
+        chunked_data = process_book(title, book, args.chunk_size, args.include_empty_lines)
+
+        if args.multi_doc:
+            for _, chunk_info in chunked_data.items():
+                merged_chunks[str(global_chunk_id)] = {
+                    "title": chunk_info["title"],
+                    "text": chunk_info["text"],
+                    "doc_id": title  # tag document origin
+                }
+                global_chunk_id += 1
+        else:
+            output_path = os.path.join(output_dir, f"{title}_chunked_{args.chunk_size}.json")
+            with open(output_path, 'w', encoding='utf-8') as out_file:
+                json.dump(chunked_data, out_file, indent=4)
+            print(f"Saved chunked output to: {output_path}")
+        
+    if args.multi_doc:
+        output_path = os.path.join(output_dir, f"merged_chunked_{args.chunk_size}.json")
+        with open(output_path, 'w', encoding='utf-8') as out_file:
+            json.dump(merged_chunks, out_file, indent=4)
+        print(f"Saved merged multi-document chunks to: {output_path}")
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Split long documents into token-bounded chunks.")
+    parser.add_argument("--dataset", type=str, default='NovelQA',
+                        help="Dataset name (used to locate ./data/<dataset>/books/)")
+    parser.add_argument("--chunk_size", type=int, default=512,
+                        help="Maximum number of tokens per chunk")
+    parser.add_argument("--include_empty_lines", action="store_true",
+                        help="Include empty lines when splitting paragraphs")
+    parser.add_argument("--multi_doc", action="store_true",
+                        help="Merge all documents into a single file with doc_id tagging")
+    args = parser.parse_args()
+    main(args)
