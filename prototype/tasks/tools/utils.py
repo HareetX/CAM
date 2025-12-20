@@ -12,13 +12,14 @@ encoding = tiktoken.get_encoding('cl100k_base')
 
 
 def count_tokens(text):
+    # return len(encoding.encode(text, allowed_special={'<|endoftext|>'}))
     return len(encoding.encode(text))
 
 
 def normalize_answer(s):
   def remove_articles(text):
     return re.sub(r"\b(a|an|the)\b", " ", text)
-  
+
   def white_space_fix(text):
       return " ".join(text.split())
 
@@ -46,17 +47,17 @@ def calculate_f1_score(predicted_answer, true_answer):
 
     if len(predicted_set) == 0:
         return 0
-    
+
     true_positives = len(predicted_set.intersection(true_set))
-    
+
     precision = true_positives / len(predicted_set)
     recall = true_positives / len(true_set)
-    
+
     if precision + recall == 0:
         f1 = 0
     else:
         f1 = 2 * (precision * recall) / (precision + recall)
-    
+
     return f1
 
 
@@ -84,7 +85,7 @@ class APIClient():
             max_tokens=max_tokens,
             temperature=temperature,
         )
-    
+
     def obtain_embedding(self, input):
         return self.client.get_embedding(input, self.embedding_model)
 
@@ -120,7 +121,7 @@ class BaseClient:
 class OpenAIClient(BaseClient):
     def __init__(self, key_path, model):
         super().__init__(key_path, model)
-        self.client = OpenAI(api_key=self.key)
+        self.client = OpenAI(api_key=self.key, base_url="https://az.gptplus5.com/v1")
 
     def send_request(self, prompt, max_tokens, temperature):
         response = self.client.chat.completions.create(
@@ -130,7 +131,7 @@ class OpenAIClient(BaseClient):
             max_tokens=max_tokens
         )
         return response.choices[0].message.content
-    
+
     def get_embedding(self, text, model):
         text = text.replace("\n", " ")
         return self.client.embeddings.create(input = [text], model=model).data[0].embedding

@@ -13,7 +13,7 @@ def find_punctuations(text, comma=False):
         puncs = ['.', '?', '!', ',', '."', '?"', '!"', ".'", "?'", "!'"]
     else:
         puncs = ['.', '?', '!', '."', '?"', '!"', ".'", "?'", "!'"]
-    
+
     puncs_idx = []
     for i, c in enumerate(text):
         if c in puncs:
@@ -21,7 +21,7 @@ def find_punctuations(text, comma=False):
         elif c == '"' or c == "'":
             if i > 0 and text[i-1] in ['.', '?', '!']:
                 puncs_idx.append(i)
-    
+
     return puncs_idx
 
 
@@ -29,7 +29,7 @@ def truncate(text, chunk_size):
     """Truncate text at safe punctuation boundaries so token count fits within chunk size."""
     ori_text = text
     ori_len = len(text)
-    
+
     while count_tokens(text) > chunk_size:
         puncs_idx = find_punctuations(text)
         try:
@@ -41,11 +41,11 @@ def truncate(text, chunk_size):
             except:
                 assert (ori_len - len(text)) == 0, f"Text truncation failed: {(ori_len - len(text))} characters of remaining 'truncated' part were discarded."
                 return text, ''
-    
+
     # new_len = len(text)
     # diff = ori_len - new_len
     truncated = ori_text[len(text):]
-    
+
     return text, truncated
 
 
@@ -66,7 +66,7 @@ def chunk_text(paragraphs, chunk_size):
                 chunks.append(curr_chunk)
             curr_chunk = chunk_truncated
             continue
-        
+
         if count_tokens(new_chunk) > chunk_size:
             chunks.append(curr_chunk)
             curr_chunk = p
@@ -87,6 +87,7 @@ def process_book(title, book, chunk_size, include_empty):
     if not include_empty:
         paragraphs = [p for p in paragraphs if len(p) > 0]
 
+    print(f"processing book: {title}")
     total_size = count_tokens('\n'.join(paragraphs))
     print(f"{title} total sizes: {total_size}")
 
@@ -104,7 +105,7 @@ def process_book(title, book, chunk_size, include_empty):
             new_data[str(index_id)]["title"] = f"{title}_chunk_{chunk_id}"
             new_data[str(index_id)]["text"] = chunk
             index_id += 1
-            
+
         chunk_sizes = [count_tokens(new_data[c]["text"]) for c in new_data.keys()]
         print(f"{title} chunk num: {len(chunk_sizes)}")
         print(f"{title} chunk sizes: {chunk_sizes}")
@@ -143,7 +144,7 @@ def main(args):
             with open(output_path, 'w', encoding='utf-8') as out_file:
                 json.dump(chunked_data, out_file, indent=4)
             print(f"Saved chunked output to: {output_path}")
-        
+
     if args.multi_doc:
         output_path = os.path.join(output_dir, f"merged_chunked_{args.chunk_size}.json")
         with open(output_path, 'w', encoding='utf-8') as out_file:

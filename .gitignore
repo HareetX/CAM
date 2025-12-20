@@ -1,0 +1,14 @@
+/backup/
+
+/data/LongMemEval/*/
+/data/LongMemEval/*.json
+
+/data/MultiHopRAG/*/
+/data/MultiHopRAG/*.json
+
+/processed_data/
+
+/super_embeddings/
+/super_graphs/
+
+*.pyc
