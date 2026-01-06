@@ -58,30 +58,35 @@ def chunk_text(paragraphs, chunk_size):
     """Split paragraphs into token-constrained chunks."""
     chunks = []
     curr_chunk = ''
+    truncated_paragraph_ids = []
 
-    for p in tqdm(paragraphs, total=len(paragraphs)):
+    for p_idx, p in tqdm(enumerate(paragraphs), total=len(paragraphs)):
         new_chunk = '\n'.join([curr_chunk, p]) if len(curr_chunk) > 0 else p
 
         # if a single paragraph is too long, split it into smaller chunks
         if count_tokens(p) > chunk_size:
             curr_chunk, chunk_truncated = truncate(new_chunk, chunk_size)
             chunks.append(curr_chunk)
+            truncated_paragraph_ids.append(p_idx)
             while count_tokens(chunk_truncated) > chunk_size:
                 curr_chunk, chunk_truncated = truncate(chunk_truncated, chunk_size)
                 chunks.append(curr_chunk)
+                truncated_paragraph_ids.append(p_idx)
             curr_chunk = chunk_truncated
             continue
 
         if count_tokens(new_chunk) > chunk_size:
             chunks.append(curr_chunk)
+            truncated_paragraph_ids.append(p_idx)
             curr_chunk = p
         else:
             curr_chunk = new_chunk
 
     if len(curr_chunk) > 0:
         chunks.append(curr_chunk)
+        truncated_paragraph_ids.append(p_idx)
 
-    return chunks
+    return chunks, truncated_paragraph_ids
 
 
 def process_book(title, book, chunk_size, include_empty):
@@ -101,7 +106,7 @@ def process_book(title, book, chunk_size, include_empty):
         new_data[str(index_id)]["title"] = f"{title}_chunk_0"
         new_data[str(index_id)]["text"] = '\n'.join(paragraphs)
     else:
-        chunks = chunk_text(paragraphs, chunk_size)
+        chunks, _ = chunk_text(paragraphs, chunk_size)
         len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
         assert len_diff == 0, f"Information lost: {len_diff}"
 
@@ -117,7 +122,7 @@ def process_book(title, book, chunk_size, include_empty):
     return new_data
 
 
-def process_conversation(title, conversation, chunk_size, include_empty):
+def process_conversation(title, conversation, chunk_size, include_empty, mode='token'):
     """Process a conversation into token-constrained chunks."""
     new_data = {}
     chunk_id = 0
@@ -127,30 +132,33 @@ def process_conversation(title, conversation, chunk_size, include_empty):
     for idx, session in enumerate(conversation.get("haystack_sessions", [])):
         date = conversation.get("haystack_dates", [])[idx] if idx < len(conversation.get("haystack_dates", [])) else "Unknown Date"
         session_text = f"Session {idx + 1} ({date}):"
-        
+
         paragraphs = []
+        paragraph_speakers = []
         for turn in session:
             role = turn.get('role', 'Unknown')
             content = turn.get('content', '')
-            turn_text = f"{role}: {content}"
-            
+            turn_text = content
+
             if include_empty:
                 paragraphs.append(turn_text)
+                paragraph_speakers.append(role)
             else:
                 if content.strip():
                     paragraphs.append(turn_text)
-        
+                    paragraph_speakers.append(role)
+
         if not paragraphs:
             continue
 
-        chunks = chunk_text(paragraphs, chunk_size)
+        chunks, truncated_paragraph_ids = chunk_text(paragraphs, chunk_size)
         len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
         assert len_diff == 0, f"Information lost: {len_diff}"
 
-        for chunk in chunks:
+        for cid, chunk in enumerate(chunks):
             new_data[str(chunk_id)] = {}
             new_data[str(chunk_id)]["title"] = f"{title}_chunk_{chunk_id}"
-            new_data[str(chunk_id)]["text"] = f"{session_text}\n{chunk}"
+            new_data[str(chunk_id)]["text"] = f"{session_text}\n{paragraph_speakers[truncated_paragraph_ids[cid]]}: {chunk}"
             chunk_id += 1
 
     chunk_sizes = [count_tokens(new_data[c]["text"]) for c in new_data.keys()]
@@ -161,8 +169,7 @@ def process_conversation(title, conversation, chunk_size, include_empty):
 
 
 def process_conversations(args):
-    # Check if args.conversation_mode is enabled
-    assert args.conversation_mode, "Conversation mode not enabled."
+    assert args.conversation_mode in ['token', 'turn'], "Unsupported conversation mode."
 
     input_dir = f'./data/{args.dataset}/conversations/'
     output_dir = f'./data/{args.dataset}/chunks/'
@@ -177,7 +184,7 @@ def process_conversations(args):
             conversation = json.load(f)
 
         title = os.path.splitext(filename)[0]
-        chunked_data = process_conversation(title, conversation, args.chunk_size, args.include_empty_lines)
+        chunked_data = process_conversation(title, conversation, args.chunk_size, args.include_empty_lines, mode=args.conversation_mode)
 
         output_path = os.path.join(output_dir, f"{title}_chunked_{args.chunk_size}.json")
         with open(output_path, 'w', encoding='utf-8') as out_file:
@@ -186,7 +193,7 @@ def process_conversations(args):
 
 
 def main(args):
-    if args.conversation_mode:
+    if args.conversation_mode != 'null':
         process_conversations(args)
         return
 
@@ -240,7 +247,7 @@ if __name__ == "__main__":
                         help="Include empty lines when splitting paragraphs")
     parser.add_argument("--multi_doc", action="store_true",
                         help="Merge all documents into a single file with doc_id tagging")
-    parser.add_argument("--conversation_mode", action="store_true",
+    parser.add_argument("--conversation_mode", type=str, default='null',
                         help="Process documents as conversations")
     args = parser.parse_args()
     main(args)
