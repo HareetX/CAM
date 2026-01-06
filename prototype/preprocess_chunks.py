@@ -10,7 +10,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def process_single_doc(filename, file_path, client, dataset, generate_gist, extract_entity):
+    file_title = os.path.splitext(filename)[0]
+    
+    output_embedding_path = f'./processed_data/{dataset}/chunk_embeddings/'
+    output_metadata_path = f'./processed_data/{dataset}/chunk_metadata/'
+    output_embedding = os.path.join(output_embedding_path, f'{file_title}_embeddings.npy')
+    output_metadata = os.path.join(output_metadata_path, f'{file_title}_metadata.json')
+    
+    if os.path.exists(output_embedding) and os.path.exists(output_metadata):
+        print(f"Skipping {filename}...")
+        return
+
     print(f"Processing {filename}...")
+    
     with open(os.path.join(file_path, filename), 'r') as f:
         data = json.load(f)
 
@@ -56,13 +68,12 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
         all_text_embedding_list.append(chunk_embedding)
 
     embeddings = np.stack(all_text_embedding_list, axis=0)
-    file_title = os.path.splitext(filename)[0]
 
-    os.makedirs(f'./processed_data/{dataset}/chunk_embeddings', exist_ok=True)
-    np.save(f'./processed_data/{dataset}/chunk_embeddings/{file_title}_embeddings.npy', embeddings)
+    os.makedirs(output_embedding_path, exist_ok=True)
+    np.save(output_embedding, embeddings)
 
-    os.makedirs(f'./processed_data/{dataset}/chunk_metadata', exist_ok=True)
-    with open(f'./processed_data/{dataset}/chunk_metadata/{file_title}_metadata.json', "w") as f:
+    os.makedirs(output_metadata_path, exist_ok=True)
+    with open(output_metadata, "w") as f:
         json.dump(all_chunk_dict_list, f, indent=4)
 
     print(f"Finished {filename}: {len(all_chunk_dict_list)} chunks, embedding shape {np.stack(embeddings).shape}")

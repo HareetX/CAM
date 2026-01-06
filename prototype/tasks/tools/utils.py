@@ -13,7 +13,11 @@ encoding = tiktoken.get_encoding('cl100k_base')
 
 def count_tokens(text):
     # return len(encoding.encode(text, allowed_special={'<|endoftext|>'}))
-    return len(encoding.encode(text))
+    try:
+        return len(encoding.encode(text))
+    except Exception as e:
+        print(f"Token counting error: {e}")
+        return len(encoding.encode(text, allowed_special={'<|endoftext|>'}))
 
 
 def normalize_answer(s):
@@ -87,7 +91,8 @@ class APIClient():
         )
 
     def obtain_embedding(self, input):
-        return self.client.get_embedding(input, self.embedding_model)
+        # return self.client.get_embedding(input, self.embedding_model)
+        return self.client.obtain_embedding(input, self.embedding_model)
 
 
 class BaseClient:
@@ -135,6 +140,19 @@ class OpenAIClient(BaseClient):
     def get_embedding(self, text, model):
         text = text.replace("\n", " ")
         return self.client.embeddings.create(input = [text], model=model).data[0].embedding
+    
+    def obtain_embedding(self, text, model):
+        embedding = None
+        num_attempts = 0
+        while embedding is None:
+            try:
+                embedding = self.get_embedding(text, model)
+            except Exception as e:
+                print(f"Embedding Error: {e}")
+                num_attempts += 1
+                print(f"Attempt {num_attempts} failed, trying again after 5 seconds...")
+                time.sleep(5)
+        return embedding
 
 
 class AnthropicClient(BaseClient):

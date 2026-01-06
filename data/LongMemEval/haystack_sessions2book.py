@@ -71,7 +71,7 @@ def convert_longmemeval_to_books(json_file, output_dir):
 
 if __name__ == "__main__":
     workspace_dir = os.path.dirname(os.path.abspath(__file__))
-    json_file = os.path.join(workspace_dir, "LongMemEval", "longmemeval_m_cleaned.json")
-    output_dir = os.path.join(workspace_dir, "LongMemEval", "books")
+    json_file = os.path.join(workspace_dir, "longmemeval_m_cleaned.json")
+    output_dir = os.path.join(workspace_dir, "books")
 
     valid_count = convert_longmemeval_to_books(json_file, output_dir)

@@ -1,4 +1,5 @@
 import os
+import random
 from tqdm import tqdm
 import numpy as np
 import warnings
@@ -10,6 +11,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from tasks.tools.prompts import text_summarization_template
 from itertools import combinations
 from multiprocessing import Pool, cpu_count
+from multiprocessing.dummy import Pool as ThreadPool
 from functools import partial
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -31,6 +33,9 @@ def parse_args():
     p.add_argument("--max_hierarchy_level", type=int, default=10, help="Maximum hierarchy levels.")
     p.add_argument("--summary_field", type=str, default="text", help="Node attribute to use as text for hierarchical summarization.")
     p.add_argument("--num_processes", type=int, default=1, help="Processes for single-doc parallel build (default=min(10,CPU)).")
+    p.add_argument("--sample_num", type=int, default=10, help="Number of files to sample for single-doc testing.")
+    p.add_argument("--num_workers_cpu", type=int, default=None, help="Workers for CPU-bound tasks in hierarchy building (None=single-processed).")
+    p.add_argument("--num_workers_io", type=int, default=None, help="Workers for I/O-bound tasks in hierarchy building (None=single-threaded).")
     return p.parse_args()
 
 class CAM:
@@ -55,6 +60,11 @@ class CAM:
         self.summary_field = summary_field
 
         self.client = APIClient("openai", api_key_path, model, embedding_model)
+        self.client_args = {
+            "api_key_path": api_key_path,
+            "model": model,
+            "embedding_model": embedding_model
+        }
 
         self.memory = nx.Graph()
         self.embeddings = None                  # [N, D]
@@ -221,7 +231,7 @@ class CAM:
         persona_graph.add_nodes_from(range(index))
         persona_graph.add_edges_from(persona_graph_edges)
 
-        personality_map = {p: n for n in graph.nodes() for p in personalities[n]}
+        personality_map = {p: n for n in graph.nodes() for p in personalities[n]} # {persona_id: original_node_id}
 
         return persona_graph, components, personalities, personality_map
     
@@ -266,7 +276,53 @@ class CAM:
         print(f"[Level {level} of {book_title}] Nodes: {num_nodes} | Edges: {num_edges} | Avg Degree: {avg_degree:.2f}")
         print(f"[Level {level} of {book_title}] Communities: {num} | Max size: {max_size} | Min size: {min_size} | Avg size: {avg_size:.2f}")
 
-    def run_hierarchy(self, book_title, max_hierarchy_level: int = 10):
+    def _parallel_label_propagation(self, graph: nx.Graph, num_workers: int):
+        """Parallel version of label propagation community detection."""
+        
+        # Inner function to process a subgraph
+        def process_subgraph(subgraph):
+            return list(nx.community.label_propagation_communities(subgraph))
+        
+        # Split graph into connected components for parallel processing
+        components = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
+
+        # Use multiprocessing Pool to process components in parallel
+        final_communities = []
+        with Pool(processes=num_workers) as pool:
+            subgraph_communities = pool.map(process_subgraph, components)
+
+        # Combine results
+        for comms in subgraph_communities:
+            final_communities.extend(comms)
+
+        return final_communities
+    
+    def _parallel_summarize_communities(self, communities, current_graph, num_threads: int, level: int, book_title: str):
+        """Parallel summarization of communities. (I/O bound)"""
+        # Prepare inputs
+        texts_list = []
+        for comm in communities:
+            node_list_sorted = sorted(list(comm))
+            texts = [current_graph.nodes[n].get(self.summary_field) for n in node_list_sorted]
+            texts_list.append(texts)
+
+        # Use ThreadPool for I/O bound tasks
+        new_texts = []
+        new_embs = []
+
+        with ThreadPool(processes=num_threads) as pool:
+            results = list(tqdm(
+                pool.imap(self._text_summarization, texts_list),
+                total=len(texts_list),
+                desc=f"Summarizing level {level} communities for {book_title}"
+            ))
+        
+        for super_gist, emb in results:
+            new_texts.append(super_gist)
+            new_embs.append(emb)
+        return new_texts, new_embs
+
+    def run_hierarchy(self, book_title, max_hierarchy_level: int = 10, num_workers_cpu: int = None, num_workers_io: int = None):
 
         self.level_graphs = []
         self.level_embeddings = []
@@ -280,12 +336,16 @@ class CAM:
 
         while True:
             persona_graph, _, _, personality_map = self._create_persona_graph(current_graph)
-            communities = list(nx.community.label_propagation_communities(persona_graph))
+            communities = []
+            if num_workers_cpu is None:
+                communities = list(nx.community.label_propagation_communities(persona_graph))
+            else:
+                communities = self._parallel_label_propagation(persona_graph, num_workers=num_workers_cpu)
             communities = self._limit_community_size(communities)
 
             # map persona communities back to original nodes
-            overlap_communities = []
-            community_dict = {}
+            overlap_communities = [] # list of sets of original node ids for each community
+            community_dict = {} # node_id -> [community_ids]
             for idx, comm in enumerate(communities):
                 original_nodes = {personality_map[pid] for pid in comm}
                 overlap_communities.append(original_nodes)
@@ -303,18 +363,22 @@ class CAM:
 
             # Build super graph for next level
             super_graph = self._build_super_graph(current_graph, overlap_communities, community_dict)
-            node_comm_dict = {idx: sorted(list(comm)) for idx, comm in enumerate(overlap_communities)}
+            node_comm_dict = {idx: sorted(list(comm)) for idx, comm in enumerate(overlap_communities)} # community_id -> [original_node_ids]
             nx.set_node_attributes(super_graph, node_comm_dict, "community")
 
             # Summarize chosen field per community
             new_texts = []
             new_embs = []
-            for comm in tqdm(overlap_communities, desc=f"Summarizing level {level-1} communities for {book_title}"):
-                node_list_sorted = sorted(list(comm))
-                texts = [current_graph.nodes[n].get(self.summary_field) for n in node_list_sorted]
-                super_gist, emb = self._text_summarization(texts)
-                new_texts.append(super_gist)
-                new_embs.append(emb)
+            if num_workers_io is None:
+                for comm in tqdm(overlap_communities, desc=f"Summarizing level {level-1} communities for {book_title}"):
+                    node_list_sorted = sorted(list(comm))
+                    texts = [current_graph.nodes[n].get(self.summary_field) for n in node_list_sorted]
+                    super_gist, emb = self._text_summarization(texts)
+                    new_texts.append(super_gist)
+                    new_embs.append(emb)
+            else:
+                # Parallel summarization
+                new_texts, new_embs = self._parallel_summarize_communities(overlap_communities, current_graph, num_threads=num_workers_io, level=level, book_title=book_title)
             new_embs = np.stack(new_embs, axis=0)
             nx.set_node_attributes(super_graph, {n: txt for n, txt in zip(super_graph.nodes(), new_texts)}, self.summary_field)
 
@@ -391,7 +455,9 @@ class CAM:
                    metadata,
                    embeddings,
                    doc_mask,
-                   max_hierarchy_level: int = 10):
+                   max_hierarchy_level: int = 10,
+                   num_workers_cpu: int = None,
+                   num_workers_io: int = None):
 
         self._prepare_output_dirs(book_title)
 
@@ -405,7 +471,7 @@ class CAM:
         self._add_edges_from_similarity(sim)
 
         # Run hierarchy & compose all levels
-        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level)
+        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
     
 def load_json(fp: str):
     with open(fp, "r", encoding="utf-8") as f:
@@ -436,7 +502,9 @@ def single_doc_worker(filename,
                       dataset,
                       chunk_size,
                       cam_kwargs,
-                      max_hierarchy_level):
+                      max_hierarchy_level,
+                      num_workers_cpu,
+                      num_workers_io):
     try:
         # filename: <book>_chunked_<chunk_size>.json
         title_stem = os.path.splitext(filename)[0]  # without .json
@@ -449,13 +517,20 @@ def single_doc_worker(filename,
                          metadata=metadata,
                          embeddings=embeddings,
                          doc_mask=None,
-                         max_hierarchy_level=max_hierarchy_level)
+                         max_hierarchy_level=max_hierarchy_level,
+                         num_workers_cpu=num_workers_cpu,
+                         num_workers_io=num_workers_io)
         return (book_title, True, "ok")
     except Exception as e:
         return (filename, False, str(e))
 
 def main():
+    random.seed(42)
+
     args = parse_args()
+
+    # Only the multi_doc mode support parallel CPU-bound tasks in hierarchy building
+    assert args.multi_doc or args.num_workers_cpu is None, "[Error] num_workers_cpu is only supported in multi_doc mode."
 
     if args.multi_doc:
         print("[Mode] Multi-document memory.")
@@ -479,7 +554,9 @@ def main():
                          metadata=metadata,
                          embeddings=embeddings,
                          doc_mask=doc_mask,
-                         max_hierarchy_level=args.max_hierarchy_level)
+                         max_hierarchy_level=args.max_hierarchy_level,
+                         num_workers_cpu=args.num_workers_cpu,
+                         num_workers_io=args.num_workers_io)
         print("[Done] Multi-document memory completed.")
 
     else:
@@ -487,6 +564,8 @@ def main():
         chunks_dir = f'./data/{args.dataset}/chunks/'
         files = [f for f in os.listdir(chunks_dir)
                  if f.endswith('.json') and f"_chunked_{args.chunk_size}.json" in f]
+        # sample 10 files for testing
+        files = random.sample(files, min(args.sample_num, len(files)))
         files.sort()
 
         if not files:
@@ -510,11 +589,14 @@ def main():
             summary_field=args.summary_field
         )
 
+        safe_num_workers_cpu = None
         worker = partial(single_doc_worker,
                          dataset=args.dataset,
                          chunk_size=args.chunk_size,
                          cam_kwargs=cam_kwargs,
-                         max_hierarchy_level=args.max_hierarchy_level)
+                         max_hierarchy_level=args.max_hierarchy_level,
+                         num_workers_cpu= safe_num_workers_cpu,
+                         num_workers_io= args.num_workers_io)
 
         successes = 0
         with Pool(processes=num_processes) as pool:

@@ -38,13 +38,13 @@ python prototype/chunks.py --dataset <dataset_name> --chunk_size <maximum number
 
 #### 2. Generate chunk embeddings and extract salient entities (optional) using an LLM:
 ```
-python prototype/preprocess_chunks.py --dataset <dataset_name> --model <LLM model to use> --embedding model <embedding model to use> --generate_gist --extract_entity
+python prototype/preprocess_chunks.py --dataset <dataset_name> --model <LLM model to use> --embedding_model <embedding model to use> --generate_gist --extract_entity
 ```
 This step creates a folder ```./processed_data/``` containing chunk embeddings and metadata.
 
 #### 3. Constructivist memory construction:
 ```
-python prototype/constructivist_memory.py --dataset <dataset_name> --chunk_size <maximum number of tokens per chunk> --threshold <edge activation threshold> --weight <weight for text similarity vs proximity> --sigma <sigma for Gaussian proximity similarity> --k <top-k neighbors per node> --max_cluster_size <maximum nodes allowed in one cluster> --max_hierarchy_level <maximum hierarchy levels> --model <LLM model to use> --embedding model <embedding model to use>
+python prototype/constructivist_memory.py --dataset <dataset_name> --chunk_size <maximum number of tokens per chunk> --threshold <edge activation threshold> --weight <weight for text similarity vs proximity> --sigma <sigma for Gaussian proximity similarity> --k <top-k neighbors per node> --max_cluster_size <maximum nodes allowed in one cluster> --max_hierarchy_level <maximum hierarchy levels> --model <LLM model to use> --embedding_model <embedding model to use>
 ``` 
 This step creates ```./super_graphs/``` (memory structures) and ```./super_embeddings/``` (node embeddings).
 
