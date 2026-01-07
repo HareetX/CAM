@@ -4,6 +4,7 @@ import json
 import argparse
 import warnings
 from typing import List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import networkx as nx
@@ -267,7 +268,153 @@ def parse_args():
     p.add_argument("--save_dir", type=str, default="./output")
     p.add_argument("--save_name", type=str, default=None, help="Override default output filename")
     p.add_argument("--save_evidence", action="store_true", help="Also store retrieved passage ids/texts")
+    p.add_argument("--workers", type=int, default=1, help="Number of parallel workers")
     return p.parse_args()
+
+
+def _process_file(file_name, cfg):
+    # Result container
+    result = {
+        'prediction_json': [],
+        'total_num': 0,
+        'correct_num': 0,
+        'all_r1': 0.0,
+        'all_r2': 0.0,
+        'all_rl': 0.0,
+    }
+
+    book_title = os.path.splitext(file_name)[0]
+    print(f"\n=== Answering Questions in {book_title} ===")
+
+    # Ensure reading memory exists
+    dataset = cfg["dataset"]
+    gexf = f"./super_graphs/{dataset}/{book_title}/{book_title}_graph_level_all.gexf"
+    npy = f"./super_embeddings/{dataset}/{book_title}/{book_title}_embedding_level_all.npy"
+    if not (os.path.exists(gexf) and os.path.exists(npy)):
+        print(f"[Skip] No reading memory found for {book_title}.")
+        return result
+
+    api_key_path = cfg["api_key_path"]
+    model = cfg["model"]
+    embedding_model = cfg["embedding_model"]
+    text_field = cfg["text_field"]
+    top_k = cfg["top_k"]
+    temperature = cfg["temperature"]
+    max_tokens = cfg["max_tokens"]
+    recall = Explorer(
+        dataset=dataset,
+        book_title=book_title,
+        api_key_path=api_key_path,
+        model=model,
+        embedding_model=embedding_model,
+        text_field=text_field,
+        top_k=top_k,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    question_path = cfg["question_path"]
+    with open(os.path.join(question_path, file_name), "r") as f:
+        question_list = json.load(f)
+
+    result['total_num'] += len(question_list)
+    local_correct = 0
+    mode = cfg["mode"]
+    if mode == "GE":
+        scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+        r1 = r2 = rl = 0.0
+
+    max_turns = cfg["max_turns"]
+    tolerance = cfg["tolerance"]
+    save_evidence = cfg["save_evidence"]
+    for qd in tqdm(question_list, leave=False):
+        qid = qd.get("QID")
+        question = qd["Question"]
+        answer = qd.get("Answer")
+        options = qd.get("Options")
+        gold = qd.get("Gold")
+        aspect = qd.get("Aspect")
+        complexity = qd.get("Complexity")
+
+        prediction, used_passages = recall.run(
+            question=question,
+            mode=mode,
+            options=options,
+            max_exploration_turns=max_turns,
+            tolerance=tolerance,
+        )
+
+        print(f"Question: {question}")
+        print(f"Prediction: {prediction}")
+
+        if mode == "MC":
+            is_correct = (str(prediction).strip().lower() == str(gold).strip().lower())
+            local_correct += 1 if is_correct else 0
+            rec = {
+                "QID": qid,
+                "Aspect": aspect,
+                "Complexity": complexity,
+                "Question": question,
+                "Options": options,
+                "Gold": gold,
+                "Prediction": prediction,
+                "Correct": is_correct,
+            }
+            print(f"Gold: {gold}")
+            print("Result: ", "Correct" if is_correct else "Incorrect")
+        else:
+            scores = scorer.score(answer, prediction)
+            r1 += scores["rouge1"].fmeasure
+            r2 += scores["rouge2"].fmeasure
+            rl += scores["rougeL"].fmeasure
+
+            score_llm = llm_judge(
+                client=recall.client,
+                question=question,
+                prediction=prediction,
+                answer=answer,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            local_correct += score_llm
+
+            rec = {
+                "QID": qid,
+                "Aspect": aspect,
+                "Complexity": complexity,
+                "Question": question,
+                "Answer": answer,
+                "Prediction": prediction,
+                "LLM_Judge": score_llm,
+                "ROUGE-1": scores["rouge1"].fmeasure,
+                "ROUGE-2": scores["rouge2"].fmeasure,
+                "ROUGE-L": scores["rougeL"].fmeasure,
+            }
+            print("Answer: ", answer)
+            print("LLM Judge", score_llm)
+            print("ROUGE-1 Score: ", scores['rouge1'].fmeasure)
+            print("ROUGE-2 Score: ", scores['rouge2'].fmeasure)
+            print("ROUGE-L Score: ", scores['rougeL'].fmeasure)
+
+        if save_evidence:
+            rec["UsedPassages"] = [{"node_id": nid, "text": txt} for nid, txt in used_passages]
+
+        result['prediction_json'].append(rec)
+
+    if mode == "MC":
+        acc = local_correct / max(1, len(question_list))
+        result['correct_num'] += local_correct
+        print(f"[{book_title}] QA accuracy (MC): {acc:.4f}")
+    else:
+        n = max(1, len(question_list))
+        print(f"[{book_title}] ROUGE-1: {r1/n:.4f} | ROUGE-2: {r2/n:.4f} | ROUGE-L: {rl/n:.4f} | LLM_Judge_Acc: {local_correct/n:.4f}")
+        result['correct_num'] += local_correct
+        result['all_r1'] += r1
+        result['all_r2'] += r2
+        result['all_rl'] += rl
+    print("=" * 25)
+
+    return result
 
 
 def main():
@@ -289,129 +436,52 @@ def main():
     correct_num = 0
 
     if mode == "GE":
-        scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
         all_r1 = all_r2 = all_rl = 0.0
 
     files = [f for f in os.listdir(question_path) if f.endswith(".json")]
     files.sort()
+    cfg = {
+        "dataset": dataset,
+        "question_path": question_path,
+        "mode": mode,
+        "api_key_path": args.api_key_path,
+        "model": args.model,
+        "embedding_model": args.embedding_model,
+        "text_field": args.text_field,
+        "top_k": args.top_k,
+        "temperature": args.temperature,
+        "max_tokens": args.max_tokens,
+        "max_turns": args.max_turns,
+        "tolerance": args.tolerance,
+        "save_evidence": args.save_evidence,
+    }
 
-    for file_name in files:
-        book_title = os.path.splitext(file_name)[0]
-        print(f"\n=== Answering Questions in {book_title} ===")
+    if args.workers <= 1 or len(files) <= 1:
+        for file_name in files:
+            res = _process_file(file_name, cfg)
 
-        # Ensure reading memory exists
-        gexf = f"./super_graphs/{dataset}/{book_title}/{book_title}_graph_level_all.gexf"
-        npy = f"./super_embeddings/{dataset}/{book_title}/{book_title}_embedding_level_all.npy"
-        if not (os.path.exists(gexf) and os.path.exists(npy)):
-            print(f"[Skip] No reading memory found for {book_title}.")
-            continue
+            prediction_json.extend(res['prediction_json'])
+            total_num += res['total_num']
+            correct_num += res['correct_num']
 
-        recall = Explorer(
-            dataset=dataset,
-            book_title=book_title,
-            api_key_path=args.api_key_path,
-            model=args.model,
-            embedding_model=args.embedding_model,
-            text_field=args.text_field,
-            top_k=args.top_k,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-        )
+            if mode == "GE":
+                all_r1 += res['all_r1']
+                all_r2 += res['all_r2']
+                all_rl += res['all_rl']
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(_process_file, file_name, cfg): file_name for file_name in files}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Files"):
+                res = fut.result()
 
-        with open(os.path.join(question_path, file_name), "r") as f:
-            question_list = json.load(f)
+                prediction_json.extend(res['prediction_json'])
+                total_num += res['total_num']
+                correct_num += res['correct_num']
 
-        total_num += len(question_list)
-        local_correct = 0
-        if mode == "GE":
-            r1 = r2 = rl = 0.0
-
-        for qd in tqdm(question_list, leave=False):
-            qid = qd.get("QID")
-            question = qd["Question"]
-            answer = qd.get("Answer")
-            options = qd.get("Options")
-            gold = qd.get("Gold")
-            aspect = qd.get("Aspect")
-            complexity = qd.get("Complexity")
-
-            prediction, used_passages = recall.run(
-                question=question,
-                mode=mode,
-                options=options,
-                max_exploration_turns=args.max_turns,
-                tolerance=args.tolerance,
-            )
-
-            print(f"Question: {question}")
-            print(f"Prediction: {prediction}")
-
-            if mode == "MC":
-                is_correct = (str(prediction).strip().lower() == str(gold).strip().lower())
-                local_correct += 1 if is_correct else 0
-                rec = {
-                    "QID": qid,
-                    "Aspect": aspect,
-                    "Complexity": complexity,
-                    "Question": question,
-                    "Options": options,
-                    "Gold": gold,
-                    "Prediction": prediction,
-                    "Correct": is_correct,
-                }
-                print(f"Gold: {gold}")
-                print("Result: ", "Correct" if is_correct else "Incorrect")
-            else:
-                scores = scorer.score(answer, prediction)
-                r1 += scores["rouge1"].fmeasure
-                r2 += scores["rouge2"].fmeasure
-                rl += scores["rougeL"].fmeasure
-
-                score_llm = llm_judge(
-                    client=recall.client,
-                    question=question,
-                    prediction=prediction,
-                    answer=answer,
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                )
-                local_correct += score_llm
-
-                rec = {
-                    "QID": qid,
-                    "Aspect": aspect,
-                    "Complexity": complexity,
-                    "Question": question,
-                    "Answer": answer,
-                    "Prediction": prediction,
-                    "LLM_Judge": score_llm,
-                    "ROUGE-1": scores["rouge1"].fmeasure,
-                    "ROUGE-2": scores["rouge2"].fmeasure,
-                    "ROUGE-L": scores["rougeL"].fmeasure,
-                }
-                print("Answer: ", answer)
-                print("LLM Judge", score_llm)
-                print("ROUGE-1 Score: ", scores['rouge1'].fmeasure)
-                print("ROUGE-2 Score: ", scores['rouge2'].fmeasure)
-                print("ROUGE-L Score: ", scores['rougeL'].fmeasure)
-
-            if args.save_evidence:
-                rec["UsedPassages"] = [{"node_id": nid, "text": txt} for nid, txt in used_passages]
-
-            prediction_json.append(rec)
-
-        if mode == "MC":
-            acc = local_correct / max(1, len(question_list))
-            correct_num += local_correct
-            print(f"[{book_title}] QA accuracy (MC): {acc:.4f}")
-        else:
-            n = max(1, len(question_list))
-            print(f"[{book_title}] ROUGE-1: {r1/n:.4f} | ROUGE-2: {r2/n:.4f} | ROUGE-L: {rl/n:.4f} | LLM_Judge_Acc: {local_correct/n:.4f}")
-            correct_num += local_correct
-            all_r1 += r1
-            all_r2 += r2
-            all_rl += rl
-        print("=" * 25)
+                if mode == "GE":
+                    all_r1 += res['all_r1']
+                    all_r2 += res['all_r2']
+                    all_rl += res['all_rl']
 
     # Summary
     if total_num == 0:

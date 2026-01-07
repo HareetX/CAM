@@ -58,35 +58,30 @@ def chunk_text(paragraphs, chunk_size):
     """Split paragraphs into token-constrained chunks."""
     chunks = []
     curr_chunk = ''
-    truncated_paragraph_ids = []
 
-    for p_idx, p in tqdm(enumerate(paragraphs), total=len(paragraphs)):
+    for p in tqdm(paragraphs, total=len(paragraphs)):
         new_chunk = '\n'.join([curr_chunk, p]) if len(curr_chunk) > 0 else p
 
         # if a single paragraph is too long, split it into smaller chunks
         if count_tokens(p) > chunk_size:
             curr_chunk, chunk_truncated = truncate(new_chunk, chunk_size)
             chunks.append(curr_chunk)
-            truncated_paragraph_ids.append(p_idx)
             while count_tokens(chunk_truncated) > chunk_size:
                 curr_chunk, chunk_truncated = truncate(chunk_truncated, chunk_size)
                 chunks.append(curr_chunk)
-                truncated_paragraph_ids.append(p_idx)
             curr_chunk = chunk_truncated
             continue
 
         if count_tokens(new_chunk) > chunk_size:
             chunks.append(curr_chunk)
-            truncated_paragraph_ids.append(p_idx)
             curr_chunk = p
         else:
             curr_chunk = new_chunk
 
     if len(curr_chunk) > 0:
         chunks.append(curr_chunk)
-        truncated_paragraph_ids.append(p_idx)
 
-    return chunks, truncated_paragraph_ids
+    return chunks
 
 
 def process_book(title, book, chunk_size, include_empty):
@@ -106,7 +101,7 @@ def process_book(title, book, chunk_size, include_empty):
         new_data[str(index_id)]["title"] = f"{title}_chunk_0"
         new_data[str(index_id)]["text"] = '\n'.join(paragraphs)
     else:
-        chunks, _ = chunk_text(paragraphs, chunk_size)
+        chunks = chunk_text(paragraphs, chunk_size)
         len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
         assert len_diff == 0, f"Information lost: {len_diff}"
 
@@ -120,6 +115,39 @@ def process_book(title, book, chunk_size, include_empty):
         print(f"{title} chunk num: {len(chunk_sizes)}")
         print(f"{title} chunk sizes: {chunk_sizes}")
     return new_data
+
+
+def chunk_conversation(paragraphs, paragraph_speakers, chunk_size):
+    """Split turn texts into token-constrained chunks."""
+    chunks = []
+    curr_chunk = ''
+
+    for p_idx, p in tqdm(enumerate(paragraphs), total=len(paragraphs)):
+        new_turn_text = f"{paragraph_speakers[p_idx]}: {p}"
+        new_chunk = '\n'.join([curr_chunk, new_turn_text]) if len(curr_chunk) > 0 else new_turn_text
+
+        # if a single paragraph is too long, split it into smaller chunks
+        if count_tokens(p) > chunk_size:
+            curr_chunk, chunk_truncated = truncate(new_chunk, chunk_size)
+            chunks.append(curr_chunk)
+            chunk_truncated = f"{paragraph_speakers[p_idx]}: {chunk_truncated}"
+            while count_tokens(chunk_truncated) > chunk_size:
+                curr_chunk, chunk_truncated = truncate(chunk_truncated, chunk_size)
+                chunks.append(curr_chunk)
+                chunk_truncated = f"{paragraph_speakers[p_idx]}: {chunk_truncated}"
+            curr_chunk = chunk_truncated
+            continue
+
+        if count_tokens(new_chunk) > chunk_size:
+            chunks.append(curr_chunk)
+            curr_chunk = new_turn_text
+        else:
+            curr_chunk = new_chunk
+
+    if len(curr_chunk) > 0:
+        chunks.append(curr_chunk)
+
+    return chunks
 
 
 def process_conversation(title, conversation, chunk_size, include_empty, mode='token'):
@@ -151,14 +179,14 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
         if not paragraphs:
             continue
 
-        chunks, truncated_paragraph_ids = chunk_text(paragraphs, chunk_size)
+        chunks = chunk_conversation(paragraphs, paragraph_speakers, chunk_size)
         len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
-        assert len_diff == 0, f"Information lost: {len_diff}"
+        assert len_diff <= 0, f"Information lost: {len_diff}"
 
-        for cid, chunk in enumerate(chunks):
+        for chunk in chunks:
             new_data[str(chunk_id)] = {}
             new_data[str(chunk_id)]["title"] = f"{title}_chunk_{chunk_id}"
-            new_data[str(chunk_id)]["text"] = f"{session_text}\n{paragraph_speakers[truncated_paragraph_ids[cid]]}: {chunk}"
+            new_data[str(chunk_id)]["text"] = f"{session_text}\n{chunk}"
             chunk_id += 1
 
     chunk_sizes = [count_tokens(new_data[c]["text"]) for c in new_data.keys()]
