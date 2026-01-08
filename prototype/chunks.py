@@ -117,7 +117,7 @@ def process_book(title, book, chunk_size, include_empty):
     return new_data
 
 
-def chunk_conversation(paragraphs, paragraph_speakers, chunk_size):
+def chunk_conversation_token(paragraphs, paragraph_speakers, chunk_size):
     """Split turn texts into token-constrained chunks."""
     chunks = []
     curr_chunk = ''
@@ -146,6 +146,32 @@ def chunk_conversation(paragraphs, paragraph_speakers, chunk_size):
 
     if len(curr_chunk) > 0:
         chunks.append(curr_chunk)
+
+    return chunks
+
+def chunk_conversation_turn(paragraphs, paragraph_speakers, chunk_size):
+    """Split turn texts into turn chunks."""
+    chunks = []
+
+    for p_idx, p in tqdm(enumerate(paragraphs), total=len(paragraphs)):
+        new_turn_text = f"{paragraph_speakers[p_idx]}: {p}"
+
+        if count_tokens(new_turn_text) > chunk_size:
+            # If a single turn exceeds chunk size, truncate it
+            truncated_turn, exceed = truncate(new_turn_text, chunk_size)
+            chunks.append(truncated_turn)
+            exceed = f"{paragraph_speakers[p_idx]}: {exceed}"
+
+            while count_tokens(exceed) > chunk_size:
+                truncated_turn, exceed = truncate(exceed, chunk_size)
+                chunks.append(truncated_turn)
+                exceed = f"{paragraph_speakers[p_idx]}: {exceed}"
+
+            if exceed.replace(f"{paragraph_speakers[p_idx]}: ", "").strip():
+                chunks.append(exceed)
+
+        else:
+            chunks.append(new_turn_text)
 
     return chunks
 
@@ -179,7 +205,11 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
         if not paragraphs:
             continue
 
-        chunks = chunk_conversation(paragraphs, paragraph_speakers, chunk_size)
+        chunks = []
+        if mode == 'turn':
+            chunks = chunk_conversation_turn(paragraphs, paragraph_speakers, chunk_size)
+        else: # mode == 'token'
+            chunks = chunk_conversation_token(paragraphs, paragraph_speakers, chunk_size)
         len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
         assert len_diff <= 0, f"Information lost: {len_diff}"
 
