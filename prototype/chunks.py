@@ -149,14 +149,14 @@ def chunk_conversation_token(paragraphs, paragraph_speakers, chunk_size):
 
     return chunks
 
-def chunk_conversation_turn(paragraphs, paragraph_speakers, chunk_size):
+def chunk_conversation_turn(paragraphs, paragraph_speakers, chunk_size: int = None):
     """Split turn texts into turn chunks."""
     chunks = []
 
     for p_idx, p in tqdm(enumerate(paragraphs), total=len(paragraphs)):
         new_turn_text = f"{paragraph_speakers[p_idx]}: {p}"
 
-        if count_tokens(new_turn_text) > chunk_size:
+        if  chunk_size is not None and count_tokens(new_turn_text) > chunk_size:
             # If a single turn exceeds chunk size, truncate it
             truncated_turn, exceed = truncate(new_turn_text, chunk_size)
             chunks.append(truncated_turn)
@@ -208,6 +208,8 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
         chunks = []
         if mode == 'turn':
             chunks = chunk_conversation_turn(paragraphs, paragraph_speakers, chunk_size)
+        elif mode == 'statement':
+            chunks = chunk_conversation_turn(paragraphs, paragraph_speakers)
         else: # mode == 'token'
             chunks = chunk_conversation_token(paragraphs, paragraph_speakers, chunk_size)
         len_diff = count_tokens(''.join(paragraphs).replace('\n', '')) - count_tokens(''.join(chunks).replace('\n', ''))
@@ -227,7 +229,8 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
 
 
 def process_conversations(args):
-    assert args.conversation_mode in ['token', 'turn'], "Unsupported conversation mode."
+    assert args.conversation_mode in ['token', 'turn', 'statement'], "Unsupported conversation mode."
+    assert args.multi_doc == False, "Multi-doc mode is not supported for conversation processing."
 
     input_dir = f'./data/{args.dataset}/conversations/'
     output_dir = f'./data/{args.dataset}/chunks/'

@@ -139,10 +139,30 @@ Please ensure the following:
 
 **Gist:** """
 
+STATEMENT_EXTRACTION = """Your task is to extract a list of clear and concise statements that accurately reflect the key information from the input Chunk.
+
+Please ensure the following:
+    - Distill the input into normalized, atomic statements.
+    - Keep the statements brief, clear, and faithful to the original content.
+
+Return ONLY valid JSON strictly following this schema:
+{{
+  "statements": ["statement1", ...]
+}}
+
+**Input Chunk:** {input_chunk}
+
+**Extracted Statements in JSON:** """
+
 
 gist_generation_template = PromptTemplate(
                         input_variables=["input_chunk"],
                         template = GIST_GENERATION,
+                        )
+
+statement_extraction_template = PromptTemplate(
+                        input_variables=["input_chunk"],
+                        template = STATEMENT_EXTRACTION,
                         )
 
 passage_selection_template = PromptTemplate(

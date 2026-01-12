@@ -1,5 +1,5 @@
 import os
-from tasks.tools.prompts import gist_generation_template, entity_extraction_template
+from tasks.tools.prompts import gist_generation_template, statement_extraction_template, entity_extraction_template
 from tqdm import tqdm
 import numpy as np
 import json
@@ -9,34 +9,56 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 
-def process_single_doc(filename, file_path, client, dataset, generate_gist, extract_entity):
+def _extract_statements_from_chunk(chunk, client):
+    es_prompt = statement_extraction_template.format(input_chunk=chunk)
+    es_response = client.obtain_response(es_prompt, max_tokens=1024, temperature=0.0, json_output=True).strip()
+    es_response = json.loads(es_response).get("statements", [])
+    es_response = [stmt.strip() for stmt in es_response if stmt.strip()]
+    return es_response
+
+def process_single_doc(filename, file_path, client, dataset, generate_gist, extract_entity, conversation_mode):
+    stmt_modes = ['statement']
+
     file_title = os.path.splitext(filename)[0]
-    
+
     output_embedding_path = f'./processed_data/{dataset}/chunk_embeddings/'
     output_metadata_path = f'./processed_data/{dataset}/chunk_metadata/'
     output_embedding = os.path.join(output_embedding_path, f'{file_title}_embeddings.npy')
     output_metadata = os.path.join(output_metadata_path, f'{file_title}_metadata.json')
-    
+    output_statement_path = f'./processed_data/{dataset}/chunk_statements/'
+
     if os.path.exists(output_embedding) and os.path.exists(output_metadata):
         print(f"Skipping {filename}...")
         return
 
     print(f"Processing {filename}...")
-    
+
     with open(os.path.join(file_path, filename), 'r') as f:
         data = json.load(f)
 
     all_chunk_dict_list = []
+    all_chunk_statement_list = []
     all_text_embedding_list = []
 
     for idx, key in enumerate(tqdm(data, desc=f"Chunks in {filename}")):
         chunk = data[key]['text']
         gg_response = ""
+        es_response = []
+        stmt_embeddings = []
         ee_response = []
 
         if generate_gist:
             gg_prompt = gist_generation_template.format(input_chunk=chunk)
             gg_response = client.obtain_response(gg_prompt, max_tokens=500, temperature=0.0).strip()
+
+        # extract statements from each chunk if conversation_mode is set
+        if conversation_mode in stmt_modes:
+            es_response = _extract_statements_from_chunk(chunk, client)
+            stmt_embeddings = []
+            for stmt in es_response:
+                stmt_embedding = client.obtain_embedding(stmt)
+                stmt_embedding = np.array(stmt_embedding, dtype=np.float32)
+                stmt_embeddings.append(stmt_embedding)
 
         # extract entity
         if extract_entity:
@@ -65,6 +87,15 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
             "doc_id": doc_id
         }
         all_chunk_dict_list.append(chunk_dict)
+        # chunk statement dict
+        if conversation_mode in stmt_modes:
+            chunk_statement_dict = {
+                "chunk_id": idx,
+                "statements": es_response,
+                "statement_embeddings": stmt_embeddings
+            }
+        all_chunk_statement_list.append(chunk_statement_dict)
+        # chunk embedding
         all_text_embedding_list.append(chunk_embedding)
 
     embeddings = np.stack(all_text_embedding_list, axis=0)
@@ -75,6 +106,25 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
     os.makedirs(output_metadata_path, exist_ok=True)
     with open(output_metadata, "w") as f:
         json.dump(all_chunk_dict_list, f, indent=4)
+
+    if conversation_mode in stmt_modes:
+        output_statement_metadata_path = os.path.join(output_statement_path, 'metadata')
+        output_statement_embedding_path = os.path.join(output_statement_path, 'embeddings')
+        output_statement_metadata = os.path.join(output_statement_metadata_path, f'{file_title}_statements.json')
+        os.makedirs(output_statement_path, exist_ok=True)
+        os.makedirs(output_statement_metadata_path, exist_ok=True)
+        os.makedirs(output_statement_embedding_path, exist_ok=True)
+        # statement embeddings
+        for idx, chunk_stmt in enumerate(all_chunk_statement_list):
+            chunk_id = chunk_stmt['chunk_id']
+            stmt_embs = chunk_stmt['statement_embeddings']
+            output_statement_embedding = os.path.join(output_statement_embedding_path, f'{file_title}_chunk_{chunk_id}_stmt_embeddings.npy')
+            np.save(output_statement_embedding, np.stack(stmt_embs, axis=0))
+            # delete statement embeddings to save spac
+            all_chunk_statement_list[idx].pop('statement_embeddings', None)
+        # statement metadata
+        with open(output_statement_metadata, "w") as f:
+            json.dump(all_chunk_statement_list, f, indent=4)
 
     print(f"Finished {filename}: {len(all_chunk_dict_list)} chunks, embedding shape {np.stack(embeddings).shape}")
 
@@ -140,16 +190,26 @@ def process_multi_doc(file_path, filename, client, dataset, generate_gist, extra
 
 def main():
     parser = argparse.ArgumentParser(description="Chunk-level gist/entity/embedding extraction")
-    parser.add_argument("--dataset", type=str, default='NovelQA', help="Dataset name")
-    parser.add_argument("--multi_doc", action="store_true", help="Enable multi-document processing")
-    parser.add_argument("--api_key_path", type=str, default="openai_key.txt", help="Path to OpenAI API key")
-    parser.add_argument("--model", type=str, default="gpt-4o-mini", help="LLM model to use")
-    parser.add_argument("--embedding_model", type=str, default="text-embedding-3-large", help="Embedding model to use")
-    parser.add_argument("--generate_gist", action="store_true", help="If set, generate a gist for each chunk")
-    parser.add_argument("--extract_entity", action="store_true", help="If set, extract entities from each chunk")
-    parser.add_argument("--max_workers", type=int, default=3, help="Max parallel workers for single-doc mode")
+    parser.add_argument("--dataset", type=str, default='NovelQA',
+                        help="Dataset name")
+    parser.add_argument("--multi_doc", action="store_true",
+                        help="Enable multi-document processing")
+    parser.add_argument("--api_key_path", type=str, default="openai_key.txt",
+                        help="Path to OpenAI API key")
+    parser.add_argument("--model", type=str, default="gpt-4o-mini",
+                        help="LLM model to use")
+    parser.add_argument("--embedding_model", type=str, default="text-embedding-3-large",
+                        help="Embedding model to use")
+    parser.add_argument("--generate_gist", action="store_true",
+                        help="If set, generate a gist for each chunk")
+    parser.add_argument("--extract_entity", action="store_true",
+                        help="If set, extract entities from each chunk")
+    parser.add_argument("--max_workers", type=int, default=3,
+                        help="Max parallel workers for single-doc mode")
     parser.add_argument("--merged_filename", type=str, default="merged_chunked_512.json",
                         help="Merged file name produced by chunk.py in multi-doc mode")
+    parser.add_argument("--conversation_mode", type=str, default="null",
+                        help="Process documents as conversations")
     args = parser.parse_args()
 
     client = APIClient("openai", args.api_key_path, args.model, args.embedding_model)
@@ -169,8 +229,8 @@ def main():
         max_workers = max(1, min(args.max_workers, len(files)))
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {executor.submit(process_single_doc, filename, file_path, client, args.dataset, args.generate_gist, args.extract_entity): filename for filename in files}
-            
+            future_to_file = {executor.submit(process_single_doc, filename, file_path, client, args.dataset, args.generate_gist, args.extract_entity, args.conversation_mode): filename for filename in files}
+
             for future in as_completed(future_to_file):
                 filename = future_to_file[future]
                 try:

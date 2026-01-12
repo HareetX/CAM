@@ -83,11 +83,13 @@ class APIClient():
         prompt: str,
         max_tokens: int,
         temperature: float,
+        json_output: bool = False,
     ):
         return self.client.obtain_response(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            json_output=json_output,
         )
 
     def obtain_embedding(self, input):
@@ -106,12 +108,22 @@ class BaseClient:
         prompt: str,
         max_tokens: int,
         temperature: float,
+        json_output: bool = False,
     ):
         response = None
         num_attempts = 0
         while response is None:
             try:
                 response = self.send_request(prompt, max_tokens, temperature)
+
+                if json_output:
+                    # Find the first '{' and last '}' in the response
+                    start_index = response.find('{')
+                    end_index = response.rfind('}') + 1
+                    json_str = response[start_index:end_index]
+                    # Validate json format
+                    assert isinstance(json.loads(json_str), dict), "Response is not valid JSON."
+                    response = json_str
             except Exception as e:
                 print(e)
                 num_attempts += 1
@@ -140,7 +152,7 @@ class OpenAIClient(BaseClient):
     def get_embedding(self, text, model):
         text = text.replace("\n", " ")
         return self.client.embeddings.create(input = [text], model=model).data[0].embedding
-    
+
     def obtain_embedding(self, text, model):
         embedding = None
         num_attempts = 0

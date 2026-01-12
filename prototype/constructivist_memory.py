@@ -36,6 +36,7 @@ def parse_args():
     p.add_argument("--sample_num", type=int, default=10, help="Number of files to sample for single-doc testing.")
     p.add_argument("--num_workers_cpu", type=int, default=None, help="Workers for CPU-bound tasks in hierarchy building (None=single-processed).")
     p.add_argument("--num_workers_io", type=int, default=None, help="Workers for I/O-bound tasks in hierarchy building (None=single-threaded).")
+    p.add_argument("--conversation_mode", type=str, default="null", help="Conversation mode for single-doc chunk preprocessing (e.g., 'null', 'token', 'turn', 'statement').")
     return p.parse_args()
 
 class CAM:
@@ -50,7 +51,7 @@ class CAM:
                 embedding_model: str = "text-embedding-3-large",
                 max_cluster_size: int = 12,
                 summary_field: str = "text"):
-        
+
         self.dataset = dataset
         self.activation_threshold = threshold
         self.w_text = weight
@@ -71,14 +72,14 @@ class CAM:
         self.doc_mask = None                    # [N, N], only used in multi-doc
         self.node_ids = []
         self.doc_ids = []
-    
+
     def _prepare_output_dirs(self, book_title):
         self.book_title = book_title
         self.graph_out_dir = f"./super_graphs/{self.dataset}/{book_title}"
         self.emb_out_dir = f"./super_embeddings/{self.dataset}/{book_title}"
         os.makedirs(self.graph_out_dir, exist_ok=True)
         os.makedirs(self.emb_out_dir, exist_ok=True)
-    
+
     def _save_level_graph_and_embeddings(self, graph: nx.Graph, embeddings: np.ndarray, level: int):
         """Save graph & embeddings for a specific level; also remember them in level arrays."""
         # Keep in memory for composing later
@@ -130,7 +131,37 @@ class CAM:
                 entities=[e for e in item.get("entity_concepts", []) if e],
                 doc_id=doc_id
             )
-    
+
+    def _add_nodes_from_stmt_metadata(self, metadata: list[dict], stmt_metadata: list[dict], title_for_default_doc: str):
+        """
+        Metadata list entries should contain:
+        - chunk_id (int)
+        - text (str)
+        - gist (str)
+        - entity_concepts (list[str])
+        - doc_id (str): optional, used in multi-doc
+        """
+        N = 0
+        for item in stmt_metadata:
+            N += len(item.get("statements", []))
+        self.node_ids = list(range(N))
+        self.doc_ids = []
+        i = 0
+        for idx, item in enumerate(stmt_metadata):
+            doc_id = item.get("doc_id", title_for_default_doc)
+            self.doc_ids.append(doc_id)
+            entity_concepts = metadata[idx].get("entity_concepts", [])
+            for stmt in item.get("statements", []):
+                self.memory.add_node(
+                    i,
+                    chunk_id=item.get("chunk_id"),
+                    text=stmt,
+                    gist=stmt,
+                    entities=[e for e in entity_concepts if e], # reuse chunk-level entities for now
+                    doc_id=doc_id
+                )
+                i += 1
+
     def _build_pairwise_similarity(self):
         """
         Build N x N similarity with text + proximity.
@@ -160,7 +191,7 @@ class CAM:
         # Weighted combination
         sim = self.w_text * text_sim + (1.0 - self.w_text) * proximity_sim
         return sim
-    
+
     def _add_edges_from_similarity(self, sim: np.ndarray):
         """
         For each node, connect to top-k neighbors above threshold.
@@ -191,7 +222,7 @@ class CAM:
                 for i in range(0, len(comm), self.max_cluster_size):
                     new_comms.append(set(comm[i:i + self.max_cluster_size]))
         return new_comms
-    
+
     def _create_persona_graph(self, graph: nx.Graph):
         components = {}
         personalities = {}
@@ -234,7 +265,7 @@ class CAM:
         personality_map = {p: n for n in graph.nodes() for p in personalities[n]} # {persona_id: original_node_id}
 
         return persona_graph, components, personalities, personality_map
-    
+
     def _build_super_graph(self, graph, communities, community_dict):
         super_graph = nx.Graph()
         super_graph.add_nodes_from(range(len(communities)))
@@ -249,7 +280,7 @@ class CAM:
                     if comm1 != comm2:
                         super_graph.add_edge(comm1, comm2)
         return super_graph
-    
+
     def _text_summarization(self, texts: list[str]):
         """LLM-based community summarization."""
         input_texts = "\n".join(f"Passage {i+1}: {text}" for i, text in enumerate(texts))
@@ -258,7 +289,7 @@ class CAM:
         super_gist = response.strip()
         super_emb = np.array(self.client.obtain_embedding(super_gist), dtype=np.float32)
         return super_gist, super_emb
-    
+
     def _print_community_stats(self, level: int, book_title: str, graph: nx.Graph, communities: list[set]):
         sizes = [len(c) for c in communities]
         num = len(sizes)
@@ -278,11 +309,11 @@ class CAM:
 
     def _parallel_label_propagation(self, graph: nx.Graph, num_workers: int):
         """Parallel version of label propagation community detection."""
-        
+
         # Inner function to process a subgraph
         def process_subgraph(subgraph):
             return list(nx.community.label_propagation_communities(subgraph))
-        
+
         # Split graph into connected components for parallel processing
         components = [graph.subgraph(c).copy() for c in nx.connected_components(graph)]
 
@@ -296,7 +327,7 @@ class CAM:
             final_communities.extend(comms)
 
         return final_communities
-    
+
     def _parallel_summarize_communities(self, communities, current_graph, num_threads: int, level: int, book_title: str):
         """Parallel summarization of communities. (I/O bound)"""
         # Prepare inputs
@@ -316,7 +347,7 @@ class CAM:
                 total=len(texts_list),
                 desc=f"Summarizing level {level} communities for {book_title}"
             ))
-        
+
         for super_gist, emb in results:
             new_texts.append(super_gist)
             new_embs.append(emb)
@@ -449,7 +480,7 @@ class CAM:
         self.memory = G_all
         self.embeddings = E_all
         print(f"[Compose] All levels composed: nodes={self.memory.number_of_nodes()}, edges={self.memory.number_of_edges()}")
-    
+
     def build_memory(self,
                    book_title,
                    metadata,
@@ -472,11 +503,46 @@ class CAM:
 
         # Run hierarchy & compose all levels
         self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
-    
+
+    def build_memory_stmt(self,
+                          book_title,
+                          metadata,
+                          embeddings,
+                          stmt_metadata,
+                          stmt_embeddings,
+                          doc_mask,
+                          max_hierarchy_level: int = 10,
+                          num_workers_cpu: int = None,
+                          num_workers_io: int = None,
+                          conversation_mode: str = "statement"):
+        assert conversation_mode is not None, "[Error] conversation_mode must be specified for statement-level memory."
+
+        self._prepare_output_dirs(book_title)
+
+        # Add nodes
+        if conversation_mode is not None:
+            self._add_nodes_from_stmt_metadata(metadata, stmt_metadata, title_for_default_doc=book_title)
+            # flatten stmt_embeddings
+            all_stmt_embs = []
+            for emb in stmt_embeddings:
+                all_stmt_embs.extend(emb)
+            self.embeddings = np.atleast_2d(np.array(all_stmt_embs)).astype(np.float32)
+        else:
+            self._add_nodes_from_metadata(metadata, title_for_default_doc=book_title)
+            self.embeddings = np.atleast_2d(embeddings).astype(np.float32)
+        self.doc_mask = doc_mask  # None for single-doc; (N,N) for multi-doc
+
+        # Build edges from pairwise similarity for level-0
+        sim = self._build_pairwise_similarity()
+        self._add_edges_from_similarity(sim)
+
+        # Run hierarchy & compose all levels
+        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
+
 def load_json(fp: str):
     with open(fp, "r", encoding="utf-8") as f:
         return json.load(f)
-    
+
 def load_single_doc(dataset: str, chunk_file_stem: str):
 
     meta_fp = f'./processed_data/{dataset}/chunk_metadata/{chunk_file_stem}_metadata.json'
@@ -486,6 +552,20 @@ def load_single_doc(dataset: str, chunk_file_stem: str):
     emb = np.load(emb_fp)
 
     return meta, emb
+
+def load_statements(dataset: str, chunk_file_stem: str):
+
+    stmt_meta_fp = f'./processed_data/{dataset}/chunk_statements/metadata/{chunk_file_stem}_statements.json'
+    stmt_emb_dir = f'./processed_data/{dataset}/chunk_statements/embeddings/'
+
+    stmt_meta = load_json(stmt_meta_fp)
+    stmt_embs = []
+    for chunk_stmt in stmt_meta:
+        chunk_id = chunk_stmt['chunk_id']
+        stmt_emb_fp = os.path.join(stmt_emb_dir, f'{chunk_file_stem}_chunk_{chunk_id}_stmt_embeddings.npy')
+        emb = np.load(stmt_emb_fp)
+        stmt_embs.append(emb)
+    return stmt_meta, stmt_embs
 
 def load_merged_doc(dataset: str):
     meta_fp = f'./processed_data/{dataset}/chunk_metadata/merged_metadata.json'
@@ -504,22 +584,44 @@ def single_doc_worker(filename,
                       cam_kwargs,
                       max_hierarchy_level,
                       num_workers_cpu,
-                      num_workers_io):
+                      num_workers_io,
+                      conversation_mode='null'):
+    # Only 'statement' mode needs special handling here
+    safe_conversation_mode = None
+    stmt_modes = ['statement']
+    if conversation_mode in stmt_modes:
+        safe_conversation_mode = conversation_mode
+
     try:
         # filename: <book>_chunked_<chunk_size>.json
         title_stem = os.path.splitext(filename)[0]  # without .json
         book_title = title_stem.split(f"_chunked_{chunk_size}")[0]
 
         metadata, embeddings = load_single_doc(dataset, title_stem)
+        if safe_conversation_mode is not None:
+            # load statement-level metadata & embeddings
+            stmt_meta, stmt_embs = load_statements(dataset, title_stem)
 
         cam = CAM(**cam_kwargs)
-        cam.build_memory(book_title=book_title,
-                         metadata=metadata,
-                         embeddings=embeddings,
-                         doc_mask=None,
-                         max_hierarchy_level=max_hierarchy_level,
-                         num_workers_cpu=num_workers_cpu,
-                         num_workers_io=num_workers_io)
+        if safe_conversation_mode is None:
+            cam.build_memory(book_title=book_title,
+                             metadata=metadata,
+                             embeddings=embeddings,
+                             doc_mask=None,
+                             max_hierarchy_level=max_hierarchy_level,
+                             num_workers_cpu=num_workers_cpu,
+                             num_workers_io=num_workers_io)
+        else:
+            cam.build_memory_stmt(book_title=book_title,
+                                  metadata=metadata,
+                                  embeddings=embeddings,
+                                  stmt_metadata=stmt_meta,
+                                  stmt_embeddings=stmt_embs,
+                                  doc_mask=None,
+                                  max_hierarchy_level=max_hierarchy_level,
+                                  num_workers_cpu=num_workers_cpu,
+                                  num_workers_io=num_workers_io,
+                                  conversation_mode=safe_conversation_mode)
         return (book_title, True, "ok")
     except Exception as e:
         return (filename, False, str(e))
@@ -595,8 +697,9 @@ def main():
                          chunk_size=args.chunk_size,
                          cam_kwargs=cam_kwargs,
                          max_hierarchy_level=args.max_hierarchy_level,
-                         num_workers_cpu= safe_num_workers_cpu,
-                         num_workers_io= args.num_workers_io)
+                         num_workers_cpu=safe_num_workers_cpu,
+                         num_workers_io=args.num_workers_io,
+                         conversation_mode=args.conversation_mode)
 
         successes = 0
         with Pool(processes=num_processes) as pool:

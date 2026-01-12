@@ -498,7 +498,7 @@ def main():
 
     # Save
     os.makedirs(args.save_dir, exist_ok=True)
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(prediction_json, f, ensure_ascii=False, indent=2)
     print(f"[Saved] {out_path}")
 

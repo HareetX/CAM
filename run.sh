@@ -18,3 +18,6 @@ else
 fi
 # Run constructivist memory model
 python prototype/constructivist_memory.py --dataset LongMemEval --chunk_size 512 --threshold 0.6 --weight 0.6 --sigma 1.0 --k 10 --max_cluster_size 12 --max_hierarchy_level 10 --model gpt-4o-mini --embedding_model text-embedding-3-large --num_processes 10 --sample_num 120 --num_workers_io 10
+
+# Run retrieval and reasoning
+python prototype/tasks/question_answering.py --dataset LongMemEval --mode GE --save_evidence --workers 10
