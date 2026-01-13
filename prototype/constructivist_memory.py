@@ -163,20 +163,37 @@ class CAM:
                 )
                 i += 1
 
-    def _kg_community_summarization(self, community: set):
+    def _kg_community_summarization(self, community: set, cluster_type: str = "node"):
         """Summarize a KG community into a text gist."""
+        assert cluster_type in ["node", "edge"], "Unsupported cluster type for KG community summarization."
         # Prepare input
         entities = []
         relationships = []
-        for node_id in community:
-            node_data = self.kg_level.nodes[node_id]
-            entities.append((node_id, node_data.get("entity_name"), node_data.get("entity_description")))
-            for neighbor in self.kg_level.neighbors(node_id):
-                if neighbor in community:
+
+        if cluster_type == "node": # node cluster
+            for node_id in community:
+                node_data = self.kg_level.nodes[node_id]
+                entities.append((node_id, node_data.get("entity_name"), node_data.get("entity_description")))
+                for neighbor in self.kg_level.neighbors(node_id):
+                    # Not only within community
                     edge_data = self.kg_level.get_edge_data(node_id, neighbor)
                     relationships.append((edge_data.get("source_entity"),
                                           edge_data.get("target_entity"),
                                           edge_data.get("relationship_description")))
+        else:  # edge cluster
+            ent_set = set()
+            for edge in community:
+                n_a, n_b = edge
+                edge_data = self.kg_level.get_edge_data(n_a, n_b)
+                relationships.append((edge_data.get("source_entity"),
+                                      edge_data.get("target_entity"),
+                                      edge_data.get("relationship_description")))
+                ent_set.add(n_a)
+                ent_set.add(n_b)
+            for node_id in ent_set:
+                node_data = self.kg_level.nodes[node_id]
+                entities.append((node_id, node_data.get("entity_name"), node_data.get("entity_description")))
+
         input_texts = ""
         input_texts += "Entities:\n"
         input_texts += "entity_name, entity_description\n"
@@ -198,7 +215,7 @@ class CAM:
 
         return super_gist, super_emb
 
-    def _add_nodes_from_kg_leiden(self, metadata: list[dict], title_for_default_doc: str, resolution_parameter: float = 1.0):
+    def _add_nodes_from_kg_leiden(self, metadata: list[dict], chunk_embedding: np.ndarray,  title_for_default_doc: str, resolution_parameter: float = 1.0):
         """
         Add nodes from constructed KG level.
         """
@@ -207,9 +224,17 @@ class CAM:
         chunk_community_map = {} # chunk_id -> list of communities (sets of node ids)
         for chunk_id in range(len(metadata)):
             # Extract subgraph for this chunk
-            nodes_in_chunk = [n for n, data in self.kg_level.nodes(data=True) if chunk_id in data.get("chunk_id")]
-            subgraph = self.kg_level.subgraph(nodes_in_chunk)
+            edges_in_chunk = [ (u, v) for u, v, data in self.kg_level.edges(data=True) if chunk_id == data.get("chunk_id", -1) ]
+            subgraph = self.kg_level.edge_subgraph(edges_in_chunk)
 
+            if subgraph.number_of_nodes() == 0: # No edges in this chunk
+                nodes_in_chunk = [n for n, data in self.kg_level.nodes(data=True) if chunk_id in data.get("chunk_id")]
+                communities = [set(nodes_in_chunk)]
+                N += len(communities)
+                chunk_community_map[chunk_id] = communities # len is 1
+                continue
+
+            # Clustering
             coms = algorithms.leiden(subgraph, weights="relationship_strength")
             communities = list(coms.communities)
 
@@ -222,14 +247,47 @@ class CAM:
 
         i = 0
         embeddings = []
-        node_communities = []
+        node_communities = [] # list of sets of node ids
         for chunk_id, communities in chunk_community_map.items():
             doc_id = title_for_default_doc
             self.doc_ids.append(doc_id)
+
+            if len(communities) == 1: # Let the whole chunk be one community
+                comm = communities[0]
+
+                entity_concepts = metadata[chunk_id].get("entity_concepts", [])
+                text = metadata[chunk_id].get("text", "")
+                gist = metadata[chunk_id].get("gist", "")
+                emb = chunk_embedding[chunk_id]
+
+                embeddings.append(emb)
+
+                self.memory.add_node(
+                    i,
+                    chunk_id=chunk_id,
+                    text=text,
+                    gist=gist,
+                    entities=entity_concepts,
+                    doc_id=doc_id
+                )
+
+                # Add edges between communities if there are shared entities
+                for prev_i in range(i):
+                    prev_comm = node_communities[prev_i]
+                    overlap_count = len(set(comm) & set(prev_comm))
+                    if overlap_count > 0:
+                        self.memory.add_edge(i, prev_i, weight=1.0)
+
+                node_communities.append(comm)
+
+                i += 1
+
+                continue
+
             for comm in communities:
                 entity_concepts = [self.kg_level.nodes[n].get("entity_name") for n in comm]
                 # Summarize node text & gist from member entities & relationships
-                text, emb = self._kg_community_summarization(comm)
+                text, emb = self._kg_community_summarization(comm, cluster_type="node")
 
                 embeddings.append(emb)
 
@@ -241,6 +299,13 @@ class CAM:
                     entities=entity_concepts,
                     doc_id=doc_id
                 )
+
+                # Add edges between communities if there are shared entities
+                for prev_i in range(i):
+                    prev_comm = node_communities[prev_i]
+                    overlap_count = len(set(comm) & set(prev_comm))
+                    if overlap_count > 0:
+                        self.memory.add_edge(i, prev_i, weight=1.0)
 
                 # Add edges between communities if there are relationships between their member nodes
                 for prev_i in range(i):
@@ -259,6 +324,122 @@ class CAM:
                         self.memory.add_edge(i, prev_i, weight=float(edge_weight))
 
                 node_communities.append(comm)
+
+                i += 1
+        return np.stack(embeddings, axis=0)
+
+    def _add_nodes_from_kg_hierarchical_link_community(self, metadata: list[dict], chunk_embedding: np.ndarray, title_for_default_doc: str, resolution_parameter: float = 1.0):
+        """
+        Add nodes from constructed KG level.
+        """
+        # Use hierarchical link communities to detect 0-level nodes for each chunk
+        N = 0
+        chunk_community_map = {} # chunk_id -> list of communities (sets of edge ids)
+        for chunk_id in range(len(metadata)):
+            # Extract subgraph for this chunk
+            edges_in_chunk = [ (u, v) for u, v, data in self.kg_level.edges(data=True) if chunk_id == data.get("chunk_id", -1) ]
+            subgraph = self.kg_level.edge_subgraph(edges_in_chunk)
+
+            if subgraph.number_of_nodes() == 0: # No edges in this chunk
+                nodes_in_chunk = [n for n, data in self.kg_level.nodes(data=True) if chunk_id in data.get("chunk_id")]
+                communities = [set( (n_a, n_b) for n_a in nodes_in_chunk for n_b in nodes_in_chunk if n_a != n_b )]
+                N += len(communities)
+                chunk_community_map[chunk_id] = communities # len is 1
+                continue
+
+            # Clustering
+            coms = algorithms.hierarchical_link_community(subgraph)
+            communities = list(coms.communities)
+
+            N += len(communities)
+
+            chunk_community_map[chunk_id] = communities
+
+        self.node_ids = list(range(N))
+        self.doc_ids = []
+
+        i = 0
+        embeddings = []
+        node_communities = [] # list of sets of node ids
+        for chunk_id, communities in chunk_community_map.items():
+            doc_id = title_for_default_doc
+            self.doc_ids.append(doc_id)
+
+            if len(communities) == 1: # Let the whole chunk be one community
+                comm = communities[0]
+
+                entity_concepts = set()
+                for n_a, n_b in comm:
+                    entity_concepts.add(self.kg_level.nodes[n_a].get("entity_name"))
+                    entity_concepts.add(self.kg_level.nodes[n_b].get("entity_name"))
+                entity_concepts = list(entity_concepts)
+
+                text = metadata[chunk_id].get("text", "")
+                gist = metadata[chunk_id].get("gist", "")
+                emb = chunk_embedding[chunk_id]
+
+                embeddings.append(emb)
+
+                self.memory.add_node(
+                    i,
+                    chunk_id=chunk_id,
+                    text=text,
+                    gist=gist,
+                    entities=entity_concepts,
+                    doc_id=doc_id
+                )
+
+                # Add edges between communities if there are shared entities
+                ent_id_set = set()
+                for n_a, n_b in comm:
+                    ent_id_set.add(n_a)
+                    ent_id_set.add(n_b)
+                for prev_i in range(i):
+                    prev_comm = node_communities[prev_i]
+                    # Calculate the overlap count between ent_id_set and prev_comm
+                    overlap_count = len(ent_id_set & prev_comm)
+                    if overlap_count > 0:
+                        self.memory.add_edge(i, prev_i, weight=1.0)
+
+                node_communities.append(ent_id_set)
+
+                i += 1
+
+                continue
+
+            for comm in communities:
+                entity_concepts = set()
+                for n_a, n_b in comm:
+                    entity_concepts.add(self.kg_level.nodes[n_a].get("entity_name"))
+                    entity_concepts.add(self.kg_level.nodes[n_b].get("entity_name"))
+                entity_concepts = list(entity_concepts)
+                # Summarize node text & gist from member entities & relationships
+                text, emb = self._kg_community_summarization(comm, cluster_type="edge")
+
+                embeddings.append(emb)
+
+                self.memory.add_node(
+                    i,
+                    chunk_id=chunk_id,
+                    text=text,
+                    gist=text,
+                    entities=entity_concepts,
+                    doc_id=doc_id
+                )
+
+                # Add edges between communities if there are relationships between their member nodes
+                ent_id_set = set()
+                for n_a, n_b in comm:
+                    ent_id_set.add(n_a)
+                    ent_id_set.add(n_b)
+                for prev_i in range(i):
+                    prev_comm = node_communities[prev_i]
+                    # Calculate the overlap count between ent_id_set and prev_comm
+                    overlap_count = len(ent_id_set & prev_comm)
+                    if overlap_count > 0:
+                        self.memory.add_edge(i, prev_i, weight=1.0)
+
+                node_communities.append(ent_id_set)
 
                 i += 1
         return np.stack(embeddings, axis=0)
@@ -736,7 +917,8 @@ class CAM:
                                       source_entity=rel['source_entity'],
                                       target_entity=rel['target_entity'],
                                       relationship_description=rel_description,
-                                      relationship_strength=safe_rel_strength)
+                                      relationship_strength=safe_rel_strength,
+                                      chunk_id=chunk_id)
                     # print(f"[KG] Edge added between node {source_id} and node {target_id}.")
 
         # assert 0, "Debug stop"
@@ -760,12 +942,14 @@ class CAM:
             # Construct KG level
             print(f"[KG] Constructing knowledge graph level for {book_title}...")
             self.kg_level = self._construct_kg(kg_metadata)
-            print(f"[KG] KG constructed: nodes={self.kg_level.number_of_nodes()}, edges={self.kg_level.number_of_edges()}.")
+            print(f"[KG] KG constructed for {book_title}: nodes={self.kg_level.number_of_nodes()}, edges={self.kg_level.number_of_edges()}.")
             if conversation_mode in ['kg', 'kg_node_cluster_wo_kg']:
-                kg_community_embeddings = self._add_nodes_from_kg_leiden(metadata, title_for_default_doc=book_title)
+                kg_community_embeddings = self._add_nodes_from_kg_leiden(metadata, chunk_embedding=embeddings, title_for_default_doc=book_title)
             elif conversation_mode in ['kg_edge_cluster_wo_kg']:
-                pass  # TODO: implement edge-based clustering if needed
-            print(f"[KG] KG communities added as level-0 nodes: total nodes={len(self.node_ids)}.")
+                kg_community_embeddings = self._add_nodes_from_kg_hierarchical_link_community(metadata, chunk_embedding=embeddings, title_for_default_doc=book_title)
+            else:
+                raise ValueError(f"[Error] Unknown conversation_mode for KG: {conversation_mode}")
+            print(f"[KG] KG communities for {book_title} added as level-0 nodes: total nodes={len(self.node_ids)}.")
             self.embeddings = np.atleast_2d(kg_community_embeddings).astype(np.float32)
         else:
             self._add_nodes_from_metadata(metadata, title_for_default_doc=book_title)
