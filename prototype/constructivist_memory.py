@@ -8,11 +8,12 @@ import argparse
 from tasks.tools.utils import APIClient
 import networkx as nx
 from sklearn.metrics.pairwise import cosine_similarity
-from tasks.tools.prompts import text_summarization_template
+from tasks.tools.prompts import text_summarization_template, kg_community_summarization_template
 from itertools import combinations
 from multiprocessing import Pool, cpu_count
 from multiprocessing.dummy import Pool as ThreadPool
 from functools import partial
+from cdlib import algorithms
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -161,6 +162,106 @@ class CAM:
                     doc_id=doc_id
                 )
                 i += 1
+
+    def _kg_community_summarization(self, community: set):
+        """Summarize a KG community into a text gist."""
+        # Prepare input
+        entities = []
+        relationships = []
+        for node_id in community:
+            node_data = self.kg_level.nodes[node_id]
+            entities.append((node_id, node_data.get("entity_name"), node_data.get("entity_description")))
+            for neighbor in self.kg_level.neighbors(node_id):
+                if neighbor in community:
+                    edge_data = self.kg_level.get_edge_data(node_id, neighbor)
+                    relationships.append((edge_data.get("source_entity"),
+                                          edge_data.get("target_entity"),
+                                          edge_data.get("relationship_description")))
+        input_texts = ""
+        input_texts += "Entities:\n"
+        input_texts += "entity_name, entity_description\n"
+        for eid, name, desc in entities:
+            input_texts += f"{name}, {desc}\n"
+
+        input_texts += "\nRelationships:\n"
+        input_texts += "source_entity, target_entity, relationship_description\n"
+        for src, tgt, desc in relationships:
+            input_texts += f"{src}, {tgt}, {desc}\n"
+
+        # Summarization prompt
+        prompt = kg_community_summarization_template.format(input_texts=input_texts)
+
+        response = self.client.obtain_response(prompt, max_tokens=1024, temperature=0.0)
+
+        super_gist = response.strip()
+        super_emb = np.array(self.client.obtain_embedding(super_gist), dtype=np.float32)
+
+        return super_gist, super_emb
+
+    def _add_nodes_from_kg_leiden(self, metadata: list[dict], title_for_default_doc: str, resolution_parameter: float = 1.0):
+        """
+        Add nodes from constructed KG level.
+        """
+        # Use Leiden communities to detect 0-level nodes for each chunk
+        N = 0
+        chunk_community_map = {} # chunk_id -> list of communities (sets of node ids)
+        for chunk_id in range(len(metadata)):
+            # Extract subgraph for this chunk
+            nodes_in_chunk = [n for n, data in self.kg_level.nodes(data=True) if chunk_id in data.get("chunk_id")]
+            subgraph = self.kg_level.subgraph(nodes_in_chunk)
+
+            coms = algorithms.leiden(subgraph, weights="relationship_strength")
+            communities = list(coms.communities)
+
+            N += len(communities)
+
+            chunk_community_map[chunk_id] = communities
+
+        self.node_ids = list(range(N))
+        self.doc_ids = []
+
+        i = 0
+        embeddings = []
+        node_communities = []
+        for chunk_id, communities in chunk_community_map.items():
+            doc_id = title_for_default_doc
+            self.doc_ids.append(doc_id)
+            for comm in communities:
+                entity_concepts = [self.kg_level.nodes[n].get("entity_name") for n in comm]
+                # Summarize node text & gist from member entities & relationships
+                text, emb = self._kg_community_summarization(comm)
+
+                embeddings.append(emb)
+
+                self.memory.add_node(
+                    i,
+                    chunk_id=chunk_id,
+                    text=text,
+                    gist=text,
+                    entities=entity_concepts,
+                    doc_id=doc_id
+                )
+
+                # Add edges between communities if there are relationships between their member nodes
+                for prev_i in range(i):
+                    prev_comm = node_communities[prev_i]
+                    edge_weight = 0.0
+                    count = 0
+                    for n1 in comm:
+                        for n2 in prev_comm:
+                            if self.kg_level.has_edge(n1, n2):
+                                edge_data = self.kg_level.get_edge_data(n1, n2)
+                                edge_weight += edge_data.get("relationship_strength", 0.0)
+                                count += 1
+                    if count > 0:
+                        edge_weight /= count
+                    if edge_weight > 0.0:
+                        self.memory.add_edge(i, prev_i, weight=float(edge_weight))
+
+                node_communities.append(comm)
+
+                i += 1
+        return np.stack(embeddings, axis=0)
 
     def _build_pairwise_similarity(self):
         """
@@ -515,7 +616,6 @@ class CAM:
                           num_workers_cpu: int = None,
                           num_workers_io: int = None,
                           conversation_mode: str = "statement"):
-        assert conversation_mode is not None, "[Error] conversation_mode must be specified for statement-level memory."
 
         self._prepare_output_dirs(book_title)
 
@@ -538,6 +638,147 @@ class CAM:
 
         # Run hierarchy & compose all levels
         self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
+
+    def _entity_similarity(self, ent_a_type: list[str], ent_a_emb: np.array, ent_b_type: list[str], ent_b_emb: np.array, alpha_meta: float) -> float:
+        """Similarity between two entity concepts using embeddings."""
+        # Get embeddings
+        emb_a = np.array(ent_a_emb, dtype=np.float32)
+        emb_b = np.array(ent_b_emb, dtype=np.float32)
+
+        # Compute cosine similarity
+        cos_sim = cosine_similarity(emb_a.reshape(1, -1), emb_b.reshape(1, -1))[0][0]
+
+        # Entity type bonus (entity_type is list[str])
+        overlap_types = set(ent_a_type) & set(ent_b_type)
+        min_type_num = min(len(ent_a_type), len(ent_b_type))
+        type_bonus = len(overlap_types) / min_type_num if min_type_num > 0 else 0.0
+
+        final_sim = alpha_meta * cos_sim + (1 - alpha_meta) * type_bonus
+        return final_sim
+
+    def _construct_kg(self, kg_metadata: list[dict]):
+        kg_level = nx.Graph()
+
+        ent_embs = []
+        ent_list = []
+
+        ent_id_map = {} # (chunk_id, entity_name) -> ent_id
+        ent_id = 0
+
+        for kg_data in kg_metadata:
+            # print(f"[KG] Processing chunk_id={kg_data['chunk_id']}...")
+            chunk_id = kg_data['chunk_id']
+            graph_elements = kg_data.get('graph_elements', {"entities": [], "relationships": []})
+            entities = graph_elements.get('entities', [])
+            relations = graph_elements.get('relationships', [])
+
+            for ent in entities:
+                key = (chunk_id, ent['entity_name'])
+                if key not in ent_id_map:
+                    # Entity linking (Add new node or Link to existing)
+                    emb = np.array(self.client.obtain_embedding(f"{ent['entity_name']}: {ent['entity_description']}"), dtype=np.float32)
+                    ent_name_lower = ent['entity_name'].lower()
+                    ent_type_lower = [t.lower() for t in ent.get('entity_type', [])]
+                    linked_id = -1
+                    sim_max = -1.0
+                    for existing_ent_id, existing_ent in enumerate(ent_list):
+                        existing_name_lower = existing_ent['entity_name'].lower()
+                        existing_type_lower = [t.lower() for t in existing_ent.get('entity_type', [])]
+                        existing_emb = ent_embs[existing_ent_id]
+
+                        if existing_name_lower == ent_name_lower:
+                            sim_max = 1.0
+                            linked_id = existing_ent_id
+                            break
+
+                        sim = self._entity_similarity(ent_type_lower, emb, existing_type_lower, existing_emb, alpha_meta=0.7)
+
+                        if sim > sim_max:
+                            sim_max = sim
+                            linked_id = existing_ent_id
+
+                    if linked_id != -1 and sim_max >= 0.85:
+                        # Link to existing entity
+                        # print(f"[KG] Linking entity '{ent['entity_name']}' in chunk {chunk_id} to existing entity id {linked_id} '{ent_list[linked_id]['entity_name']}' (sim={sim_max:.4f}).")
+                        kg_level.nodes[linked_id]['chunk_id'].append(chunk_id)
+                        ent_id_map[key] = linked_id
+                        # print(f"[KG] Updated node {linked_id} chunk_id list: {kg_level.nodes[linked_id]['chunk_id']}.")
+                        # print(f"[KG] After linking, ent_list size: {len(ent_list)}. node number: {kg_level.number_of_nodes()}.")
+                    else:
+                        linked_id = -1
+                        ent_id_map[key] = ent_id
+
+                    if linked_id == -1:
+                        # Add new entity node
+                        # print(f"[KG] Adding new entity '{ent['entity_name']}' in chunk {chunk_id} as entity id {ent_id}.")
+                        kg_level.add_node(ent_id,
+                                          chunk_id=[chunk_id],
+                                          entity_name=ent['entity_name'],
+                                          entity_description=ent['entity_description'],
+                                          entity_type=ent.get('entity_type', []))
+                        ent_embs.append(emb)
+                        ent_list.append(ent)
+                        # print(f"[KG] ent_list size: {len(ent_list)}. node number: {kg_level.number_of_nodes()}.")
+                        ent_id += 1
+
+            for rel in relations:
+                source_key = (chunk_id, rel['source_entity'])
+                target_key = (chunk_id, rel['target_entity'])
+                rel_description = rel.get('relationship_description', '')
+                rel_strength = rel.get('relationship_strength', 0.0)
+                safe_rel_strength = min(max(rel_strength / 10, 0.0), 1.0)
+                # print(f"[KG] Processing relation: {rel['source_entity']} --({rel_description}, strength={safe_rel_strength:.4f})--> {rel['target_entity']}")
+                if source_key in ent_id_map and target_key in ent_id_map:
+                    # print(f"[KG] Adding edge between '{rel['source_entity']}' and '{rel['target_entity']}' with strength {safe_rel_strength:.4f}.")
+                    source_id = ent_id_map[source_key]
+                    target_id = ent_id_map[target_key]
+                    kg_level.add_edge(source_id, target_id,
+                                      source_entity=rel['source_entity'],
+                                      target_entity=rel['target_entity'],
+                                      relationship_description=rel_description,
+                                      relationship_strength=safe_rel_strength)
+                    # print(f"[KG] Edge added between node {source_id} and node {target_id}.")
+
+        # assert 0, "Debug stop"
+        return kg_level
+
+    def build_memory_kg(self,
+                        book_title,
+                        metadata,
+                        embeddings,
+                        kg_metadata,
+                        doc_mask,
+                        max_hierarchy_level: int = 10,
+                        num_workers_cpu: int = None,
+                        num_workers_io: int = None,
+                        conversation_mode: str = 'kg'):
+
+        self._prepare_output_dirs(book_title)
+
+        # Add nodes
+        if conversation_mode is not None:
+            # Construct KG level
+            print(f"[KG] Constructing knowledge graph level for {book_title}...")
+            self.kg_level = self._construct_kg(kg_metadata)
+            print(f"[KG] KG constructed: nodes={self.kg_level.number_of_nodes()}, edges={self.kg_level.number_of_edges()}.")
+            if conversation_mode in ['kg', 'kg_node_cluster_wo_kg']:
+                kg_community_embeddings = self._add_nodes_from_kg_leiden(metadata, title_for_default_doc=book_title)
+            elif conversation_mode in ['kg_edge_cluster_wo_kg']:
+                pass  # TODO: implement edge-based clustering if needed
+            print(f"[KG] KG communities added as level-0 nodes: total nodes={len(self.node_ids)}.")
+            self.embeddings = np.atleast_2d(kg_community_embeddings).astype(np.float32)
+        else:
+            self._add_nodes_from_metadata(metadata, title_for_default_doc=book_title)
+            self.embeddings = np.atleast_2d(embeddings).astype(np.float32)
+        self.doc_mask = doc_mask  # None for single-doc; (N,N) for multi-doc
+
+        # Build edges from pairwise similarity for level-0
+        sim = self._build_pairwise_similarity()
+        self._add_edges_from_similarity(sim)
+
+        # Run hierarchy & compose all levels
+        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
+
 
 def load_json(fp: str):
     with open(fp, "r", encoding="utf-8") as f:
@@ -567,6 +808,11 @@ def load_statements(dataset: str, chunk_file_stem: str):
         stmt_embs.append(emb)
     return stmt_meta, stmt_embs
 
+def load_kg(dataset: str, chunk_file_stem: str):
+    kg_meta_fp = f'./processed_data/{dataset}/chunk_kg/metadata/{chunk_file_stem}_kg.json'
+    kg_meta = load_json(kg_meta_fp)
+    return kg_meta
+
 def load_merged_doc(dataset: str):
     meta_fp = f'./processed_data/{dataset}/chunk_metadata/merged_metadata.json'
     emb_fp = f'./processed_data/{dataset}/chunk_embeddings/merged_embeddings.npy'
@@ -589,7 +835,8 @@ def single_doc_worker(filename,
     # Only 'statement' mode needs special handling here
     safe_conversation_mode = None
     stmt_modes = ['statement']
-    if conversation_mode in stmt_modes:
+    kg_modes = ['kg', 'kg_node_cluster_wo_kg', 'kg_edge_cluster_wo_kg']
+    if conversation_mode in stmt_modes + kg_modes:
         safe_conversation_mode = conversation_mode
 
     try:
@@ -598,9 +845,12 @@ def single_doc_worker(filename,
         book_title = title_stem.split(f"_chunked_{chunk_size}")[0]
 
         metadata, embeddings = load_single_doc(dataset, title_stem)
-        if safe_conversation_mode is not None:
+        if safe_conversation_mode is not None and safe_conversation_mode in stmt_modes:
             # load statement-level metadata & embeddings
             stmt_meta, stmt_embs = load_statements(dataset, title_stem)
+        if safe_conversation_mode is not None and safe_conversation_mode in kg_modes:
+            # load knowledge graph metadata
+            kg_meta = load_kg(dataset, title_stem)
 
         cam = CAM(**cam_kwargs)
         if safe_conversation_mode is None:
@@ -611,7 +861,7 @@ def single_doc_worker(filename,
                              max_hierarchy_level=max_hierarchy_level,
                              num_workers_cpu=num_workers_cpu,
                              num_workers_io=num_workers_io)
-        else:
+        elif safe_conversation_mode in stmt_modes:
             cam.build_memory_stmt(book_title=book_title,
                                   metadata=metadata,
                                   embeddings=embeddings,
@@ -622,6 +872,19 @@ def single_doc_worker(filename,
                                   num_workers_cpu=num_workers_cpu,
                                   num_workers_io=num_workers_io,
                                   conversation_mode=safe_conversation_mode)
+        elif safe_conversation_mode in kg_modes:
+            cam.build_memory_kg(book_title=book_title,
+                                metadata=metadata,
+                                embeddings=embeddings,
+                                kg_metadata=kg_meta,
+                                doc_mask=None,
+                                max_hierarchy_level=max_hierarchy_level,
+                                num_workers_cpu=num_workers_cpu,
+                                num_workers_io=num_workers_io,
+                                conversation_mode=safe_conversation_mode)
+        else:
+            raise ValueError(f"[Error] Unknown conversation_mode: {safe_conversation_mode}")
+
         return (book_title, True, "ok")
     except Exception as e:
         return (filename, False, str(e))

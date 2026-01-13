@@ -1,4 +1,4 @@
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
 
 ENTITY_EXTRACTION = """You are an advanced expert tasked with extracting entity concepts from a given text passage. For the input text provided below, identify the most dominant entity concepts mentioned (up to a maximum of FIVE), including specific names of people, items, and locations.
@@ -26,6 +26,23 @@ Please ensure the following:
 - Do not provide any additional explanations beyond the narrative summary.
 
 **Narrative Passages:**
+{input_texts}
+
+**Summary:** """
+
+KG_COMMUNITY_SUMMARIZATION = """You are an advanced knowledge graph agent designed to synthesize structured data into coherent narratives.
+
+For the following set of Entities and Relationships representing a specific community within a knowledge graph, your task is to generate a concise, coherent, and comprehensive summary.
+
+Please ensure the following:
+- Synthesize the isolated facts (entities and relationships) into a fluid, natural language paragraph.
+- Identify the central theme or event connecting the entities.
+- Integrate all key details (who, what, where, actions) without simply listing the data rows.
+- Ignore technical identifiers (IDs) and focus on the semantic meaning.
+- Output your summary directly, keeping it moderately long, maintaining the narrative order, including essential details, but avoiding excessive length.
+- Do not provide any additional explanations beyond the narrative summary.
+
+**Graph Community Data:**
 {input_texts}
 
 **Summary:** """
@@ -154,6 +171,43 @@ Return ONLY valid JSON strictly following this schema:
 
 **Extracted Statements in JSON:** """
 
+KG_EXTRACTION = """Your task is to extract a list of entities and their relationships from the input Chunk. Given a text chunk, first identify all entities needed from the text in order to capture the information and ideas in the text.
+Next, report all relationships among the identified entities.
+
+**Steps:**
+1. Identify all entities. For each identified entity, extract the following information:
+- entity_name: Name of the entity, capitalized
+- entity_type: Suggest several labels or categories for the entity. The categories should not be specific, but should be as general as possible.
+- entity_description: Comprehensive description of the entity's attributes and activities
+Format each entity as {{"graph_element": "entity", "entity_name": <entity_name>, "entity_type": <entity_type>, "entity_description": <entity_description>}}
+
+2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly related* to each other.
+For each pair of related entities, extract the following information:
+- source_entity: name of the source entity, as identified in step 1
+- target_entity: name of the target entity, as identified in step 1
+- relationship_description: explanation as to why you think the source entity and the target entity are related to each other
+- relationship_strength: a numeric score indicating strength of the relationship between the source entity and target entity (on a scale of 1 to 10, where 1 means a very weak relationship and 10 means a very strong relationship)
+Format each relationship as {{"graph_element": "relationship", "source_entity": <source_entity>, "target_entity": <target_entity>, "relationship_description": <relationship_description>, "relationship_strength": <relationship_strength>}}
+
+3. Return output in English as a JSON format Dict of all the entities and relationships identified in steps 1 and 2.
+Format the output as a JSON format:
+{{
+  "graph_elements": {{
+    "entities": [
+      {{graph_element": "entity", "entity_name": <entity_name>, "entity_type": <entity_type>, "entity_description": <entity_description>}},
+      ...
+    ],
+    "relationships": [
+      {{graph_element": "relationship", "source_entity": <source_entity>, "target_entity": <target_entity>, "relationship_description": <relationship_description>, "relationship_strength": <relationship_strength>}},
+      ...
+  }}
+}}
+
+**Input Chunk:** {input_chunk}
+
+**Extracted Graph Elements in JSON:**
+"""
+
 
 gist_generation_template = PromptTemplate(
                         input_variables=["input_chunk"],
@@ -163,6 +217,11 @@ gist_generation_template = PromptTemplate(
 statement_extraction_template = PromptTemplate(
                         input_variables=["input_chunk"],
                         template = STATEMENT_EXTRACTION,
+                        )
+
+kg_extraction_template = PromptTemplate(
+                        input_variables=["input_chunk"],
+                        template=KG_EXTRACTION,
                         )
 
 passage_selection_template = PromptTemplate(
@@ -178,6 +237,11 @@ entity_extraction_template = PromptTemplate(
 text_summarization_template = PromptTemplate(
                         input_variables=["input_texts"],
                         template = TEXT_SUMMARIZATION,
+                        )
+
+kg_community_summarization_template = PromptTemplate(
+                        input_variables=["input_texts"],
+                        template = KG_COMMUNITY_SUMMARIZATION,
                         )
 
 final_response_mc_template = PromptTemplate(

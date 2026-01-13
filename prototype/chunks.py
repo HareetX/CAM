@@ -181,6 +181,8 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
     new_data = {}
     chunk_id = 0
 
+    unconstrained_turn_modes = ['statement', 'kg', 'kg_node_cluster_wo_kg', 'kg_edge_cluster_wo_kg']
+
     print(f"processing conversation: {title}")
 
     for idx, session in enumerate(conversation.get("haystack_sessions", [])):
@@ -208,7 +210,7 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
         chunks = []
         if mode == 'turn':
             chunks = chunk_conversation_turn(paragraphs, paragraph_speakers, chunk_size)
-        elif mode == 'statement':
+        elif mode in unconstrained_turn_modes:
             chunks = chunk_conversation_turn(paragraphs, paragraph_speakers)
         else: # mode == 'token'
             chunks = chunk_conversation_token(paragraphs, paragraph_speakers, chunk_size)
@@ -229,7 +231,7 @@ def process_conversation(title, conversation, chunk_size, include_empty, mode='t
 
 
 def process_conversations(args):
-    assert args.conversation_mode in ['token', 'turn', 'statement'], "Unsupported conversation mode."
+    assert args.conversation_mode in ['token', 'turn', 'statement', 'kg', 'kg_node_cluster_wo_kg', 'kg_edge_cluster_wo_kg'], "Unsupported conversation mode."
     assert args.multi_doc == False, "Multi-doc mode is not supported for conversation processing."
 
     input_dir = f'./data/{args.dataset}/conversations/'

@@ -32,21 +32,25 @@ def backup_results(backup_dirname: str, dataset: str, workspace: str = "."):
     backup_processed_data_dir = os.path.join(backup_dir, "processed_data", dataset)
     os.makedirs(os.path.dirname(backup_processed_data_dir), exist_ok=True)
     if os.path.exists(processed_data_dir):
-        os.rename(processed_data_dir, backup_processed_data_dir)
+        shutil.copytree(processed_data_dir, backup_processed_data_dir)
+        # os.rename(processed_data_dir, backup_processed_data_dir)
 
     backup_super_embeddings_dir = os.path.join(backup_dir, "super_embeddings", dataset)
     os.makedirs(os.path.dirname(backup_super_embeddings_dir), exist_ok=True)
     if os.path.exists(super_embeddings_dir):
-        os.rename(super_embeddings_dir, backup_super_embeddings_dir)
+        shutil.copytree(super_embeddings_dir, backup_super_embeddings_dir)
+        # os.rename(super_embeddings_dir, backup_super_embeddings_dir)
     backup_super_graphs_dir = os.path.join(backup_dir, "super_graphs", dataset)
     os.makedirs(os.path.dirname(backup_super_graphs_dir), exist_ok=True)
     if os.path.exists(super_graphs_dir):
-        os.rename(super_graphs_dir, backup_super_graphs_dir)
+        shutil.copytree(super_graphs_dir, backup_super_graphs_dir)
+        # os.rename(super_graphs_dir, backup_super_graphs_dir)
 
     backup_output_dir = os.path.join(backup_dir, "output")
     os.makedirs(os.path.dirname(backup_output_dir), exist_ok=True)
     if os.path.exists(output_dirs):
-        os.rename(output_dirs, backup_output_dir)
+        shutil.copytree(output_dirs, backup_output_dir)
+        # os.rename(output_dirs, backup_output_dir)
 
     print(f"Backup completed at {backup_dir}")
 

@@ -1,5 +1,10 @@
 import os
-from tasks.tools.prompts import gist_generation_template, statement_extraction_template, entity_extraction_template
+from tasks.tools.prompts import (
+    gist_generation_template,
+    statement_extraction_template,
+    entity_extraction_template,
+    kg_extraction_template
+)
 from tqdm import tqdm
 import numpy as np
 import json
@@ -16,8 +21,21 @@ def _extract_statements_from_chunk(chunk, client):
     es_response = [stmt.strip() for stmt in es_response if stmt.strip()]
     return es_response
 
+
+def _extract_kg_from_chunk(chunk, client):
+    ekg_prompt = kg_extraction_template.format(input_chunk=chunk)
+    ekg_response = client.obtain_response(ekg_prompt, max_tokens=16384, temperature=0.0, json_output=True).strip()
+    try:
+        ekg_response = json.loads(ekg_response).get("graph_elements", {"entities": [], "relationships": []})
+    except json.JSONDecodeError:
+        # print(ekg_response)
+        ekg_response = {"entities": [], "relationships": []}
+    return ekg_response
+
+
 def process_single_doc(filename, file_path, client, dataset, generate_gist, extract_entity, conversation_mode):
     stmt_modes = ['statement']
+    kg_modes = ['kg', 'kg_node_cluster_wo_kg', 'kg_edge_cluster_wo_kg']
 
     file_title = os.path.splitext(filename)[0]
 
@@ -26,6 +44,7 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
     output_embedding = os.path.join(output_embedding_path, f'{file_title}_embeddings.npy')
     output_metadata = os.path.join(output_metadata_path, f'{file_title}_metadata.json')
     output_statement_path = f'./processed_data/{dataset}/chunk_statements/'
+    output_kg_path = f'./processed_data/{dataset}/chunk_kg/'
 
     if os.path.exists(output_embedding) and os.path.exists(output_metadata):
         print(f"Skipping {filename}...")
@@ -38,6 +57,7 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
 
     all_chunk_dict_list = []
     all_chunk_statement_list = []
+    all_chunk_kg_list = []
     all_text_embedding_list = []
 
     for idx, key in enumerate(tqdm(data, desc=f"Chunks in {filename}")):
@@ -59,6 +79,10 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
                 stmt_embedding = client.obtain_embedding(stmt)
                 stmt_embedding = np.array(stmt_embedding, dtype=np.float32)
                 stmt_embeddings.append(stmt_embedding)
+
+        # extract kg entities and relations from each chunk if conversation_mode is set
+        if conversation_mode in kg_modes:
+            ekg_response = _extract_kg_from_chunk(chunk, client)
 
         # extract entity
         if extract_entity:
@@ -87,6 +111,7 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
             "doc_id": doc_id
         }
         all_chunk_dict_list.append(chunk_dict)
+
         # chunk statement dict
         if conversation_mode in stmt_modes:
             chunk_statement_dict = {
@@ -94,7 +119,16 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
                 "statements": es_response,
                 "statement_embeddings": stmt_embeddings
             }
-        all_chunk_statement_list.append(chunk_statement_dict)
+            all_chunk_statement_list.append(chunk_statement_dict)
+
+        # chunk kg dict
+        if conversation_mode in kg_modes:
+            chunk_kg_dict = {
+                "chunk_id": idx,
+                "graph_elements": ekg_response
+            }
+            all_chunk_kg_list.append(chunk_kg_dict)
+
         # chunk embedding
         all_text_embedding_list.append(chunk_embedding)
 
@@ -125,6 +159,15 @@ def process_single_doc(filename, file_path, client, dataset, generate_gist, extr
         # statement metadata
         with open(output_statement_metadata, "w") as f:
             json.dump(all_chunk_statement_list, f, indent=4)
+
+    if conversation_mode in kg_modes:
+        output_kg_metadata_path = os.path.join(output_kg_path, 'metadata')
+        os.makedirs(output_kg_path, exist_ok=True)
+        os.makedirs(output_kg_metadata_path, exist_ok=True)
+        output_kg_metadata = os.path.join(output_kg_metadata_path, f'{file_title}_kg.json')
+        # kg metadata
+        with open(output_kg_metadata, "w") as f:
+            json.dump(all_chunk_kg_list, f, indent=4)
 
     print(f"Finished {filename}: {len(all_chunk_dict_list)} chunks, embedding shape {np.stack(embeddings).shape}")
 
