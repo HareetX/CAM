@@ -2,11 +2,12 @@ import json
 import argparse
 import sys
 from collections import defaultdict
+import csv
 
 def load_json(file_path):
     """读取JSON文件"""
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding="gbk") as f:
             return json.load(f)
     except FileNotFoundError:
         print(f"错误: 找不到文件 '{file_path}'")
@@ -55,7 +56,7 @@ def calculate_metrics(output_data, reference_data):
     # 2. 初始化存储结构
     # 结构: { 'Type': { 'Metric': [val1, val2] } }
     metrics_storage = defaultdict(lambda: defaultdict(list))
-    
+
     # 需要统计的指标键名 (Output 文件中的 key)
     target_metrics = ['LLM_Judge', 'ROUGE-1', 'ROUGE-2', 'ROUGE-L']
 
@@ -66,14 +67,14 @@ def calculate_metrics(output_data, reference_data):
         qid = item.get('QID')
         if not qid:
             qid = item.get('question_id')  # 兼容不同命名
-        
+
         # 如果 QID 缺失或不在 reference 中，跳过 (或者你可以选择归为 Unknown)
         if not qid or qid not in qid_to_type:
             continue
-        
+
         q_type = qid_to_type[qid]
         matched_count += 1
-        
+
         # 提取指标并存入对应分类和 Overall
         for metric in target_metrics:
             # 获取分数，默认为 0.0
@@ -82,8 +83,8 @@ def calculate_metrics(output_data, reference_data):
                 val = 0.0
                 if metric == 'LLM_Judge':
                     val = item.get('autoeval_label', {}).get('label', 0.0)
-                    
-            
+
+
             # 添加到对应 Type
             metrics_storage[q_type][metric].append(val)
             # 添加到 Overall
@@ -95,10 +96,10 @@ def print_table(metrics_storage, target_metrics):
     """打印格式化表格"""
     # 定义表头
     headers = ['Question Type', 'Count'] + target_metrics
-    
+
     # 定义行格式: Type占30字符, Count占8字符, 指标各占12字符
     row_format = "{:<30} | {:<8} | " + " | ".join(["{:<12}"] * len(target_metrics))
-    
+
     separator = "-" * (30 + 8 + 3 + (15 * len(target_metrics)))
 
     print(separator)
@@ -114,7 +115,7 @@ def print_table(metrics_storage, target_metrics):
         data = metrics_storage[q_type]
         # 获取样本数量 (假设所有指标样本数一致)
         count = len(data[target_metrics[0]]) if target_metrics else 0
-        
+
         # 计算平均值并格式化为百分比
         avgs = []
         for metric in target_metrics:
@@ -124,15 +125,42 @@ def print_table(metrics_storage, target_metrics):
             avgs.append(f"{avg*100:.2f}")
 
         print(row_format.format(q_type, count, *avgs))
-    
+
     print(separator)
+
+def save_metrics_to_csv(metrics_storage, target_metrics, output_csv):
+    """将指标保存到 CSV 文件"""
+    with open(output_csv, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+
+        # 写入表头
+        headers = ['Question Type', 'Count'] + target_metrics
+        writer.writerow(headers)
+
+        # 排序：按字母顺序排序类型，确保 'Overall' 在最后
+        sorted_types = sorted([t for t in metrics_storage.keys() if t != 'Overall'])
+        if 'Overall' in metrics_storage:
+            sorted_types.append('Overall')
+
+        for q_type in sorted_types:
+            data = metrics_storage[q_type]
+            count = len(data[target_metrics[0]]) if target_metrics else 0
+
+            # 计算平均值
+            avgs = []
+            for metric in target_metrics:
+                values = data[metric]
+                avg = sum(values) / len(values) if values else 0.0
+                avgs.append(f"{avg*100:.2f}")
+
+            writer.writerow([q_type, count] + avgs)
 
 def main():
     # 设置命令行参数
     parser = argparse.ArgumentParser(description="计算并打印 QA 实验指标 (按 Question Type 分组)")
     parser.add_argument('output_file', help="Output 文件路径 (包含 QID 和 分数)")
     parser.add_argument('reference_file', help="Reference 文件路径 (包含 question_id 和 question_type)")
-    
+
     args = parser.parse_args()
 
     # 加载数据
@@ -150,6 +178,10 @@ def main():
         print(f"\n成功匹配样本数: {count}")
         print("\n实验结果 (平均分 %):")
         print_table(metrics_storage, target_metrics)
+
+        # 保存到 CSV
+        output_csv = args.output_file.rsplit('.', 1)[0] + '_metrics.csv'
+        save_metrics_to_csv(metrics_storage, target_metrics, output_csv)
 
 if __name__ == "__main__":
     main()

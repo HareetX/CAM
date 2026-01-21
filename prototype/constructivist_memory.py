@@ -172,11 +172,11 @@ class CAM:
 
         if cluster_type == "node": # node cluster
             for node_id in community:
-                node_data = self.kg_level.nodes[node_id]
+                node_data = self.kg.nodes[node_id]
                 entities.append((node_id, node_data.get("entity_name"), node_data.get("entity_description")))
-                for neighbor in self.kg_level.neighbors(node_id):
+                for neighbor in self.kg.neighbors(node_id):
                     # Not only within community
-                    edge_data = self.kg_level.get_edge_data(node_id, neighbor)
+                    edge_data = self.kg.get_edge_data(node_id, neighbor)
                     relationships.append((edge_data.get("source_entity"),
                                           edge_data.get("target_entity"),
                                           edge_data.get("relationship_description")))
@@ -184,14 +184,14 @@ class CAM:
             ent_set = set()
             for edge in community:
                 n_a, n_b = edge
-                edge_data = self.kg_level.get_edge_data(n_a, n_b)
+                edge_data = self.kg.get_edge_data(n_a, n_b)
                 relationships.append((edge_data.get("source_entity"),
                                       edge_data.get("target_entity"),
                                       edge_data.get("relationship_description")))
                 ent_set.add(n_a)
                 ent_set.add(n_b)
             for node_id in ent_set:
-                node_data = self.kg_level.nodes[node_id]
+                node_data = self.kg.nodes[node_id]
                 entities.append((node_id, node_data.get("entity_name"), node_data.get("entity_description")))
 
         input_texts = ""
@@ -224,11 +224,11 @@ class CAM:
         chunk_community_map = {} # chunk_id -> list of communities (sets of node ids)
         for chunk_id in range(len(metadata)):
             # Extract subgraph for this chunk
-            edges_in_chunk = [ (u, v) for u, v, data in self.kg_level.edges(data=True) if chunk_id == data.get("chunk_id", -1) ]
-            subgraph = self.kg_level.edge_subgraph(edges_in_chunk)
+            edges_in_chunk = [ (u, v) for u, v, data in self.kg.edges(data=True) if chunk_id == data.get("chunk_id", -1) ]
+            subgraph = self.kg.edge_subgraph(edges_in_chunk)
 
             if subgraph.number_of_nodes() == 0: # No edges in this chunk
-                nodes_in_chunk = [n for n, data in self.kg_level.nodes(data=True) if chunk_id in data.get("chunk_id")]
+                nodes_in_chunk = [n for n, data in self.kg.nodes(data=True) if chunk_id in data.get("chunk_id")]
                 communities = [set(nodes_in_chunk)]
                 N += len(communities)
                 chunk_community_map[chunk_id] = communities # len is 1
@@ -285,7 +285,7 @@ class CAM:
                 continue
 
             for comm in communities:
-                entity_concepts = [self.kg_level.nodes[n].get("entity_name") for n in comm]
+                entity_concepts = [self.kg.nodes[n].get("entity_name") for n in comm]
                 # Summarize node text & gist from member entities & relationships
                 text, emb = self._kg_community_summarization(comm, cluster_type="node")
 
@@ -314,8 +314,8 @@ class CAM:
                     count = 0
                     for n1 in comm:
                         for n2 in prev_comm:
-                            if self.kg_level.has_edge(n1, n2):
-                                edge_data = self.kg_level.get_edge_data(n1, n2)
+                            if self.kg.has_edge(n1, n2):
+                                edge_data = self.kg.get_edge_data(n1, n2)
                                 edge_weight += edge_data.get("relationship_strength", 0.0)
                                 count += 1
                     if count > 0:
@@ -328,20 +328,99 @@ class CAM:
                 i += 1
         return np.stack(embeddings, axis=0)
 
-    def _add_nodes_from_kg_hierarchical_link_community(self, metadata: list[dict], chunk_embedding: np.ndarray, title_for_default_doc: str, resolution_parameter: float = 1.0):
+    def _add_kg_level_graph_from_kg(self, num_workers_io: int = None):
+        self.kg_level = nx.Graph()
+        self.kg_level_embeddings = []
+
+        # Both entities and relationships are the nodes in this level, the edges are links between them
+        node_id = 0
+        node_map = {}  # original node id -> kg_level node id
+        edge_map = {}  # original edge (u,v) -> kg_level node id
+
+        for n, data in self.kg.nodes(data=True):
+            text = f"{data.get('entity_name')}: {data.get('entity_description')}"
+
+            self.kg_level.add_node(
+                node_id,
+                text=text,
+                node_type="entity",
+                entity_name=data.get("entity_name"),
+                entity_description=data.get("entity_description"),
+                chunk_id=data.get("chunk_id"),
+            )
+
+            node_map[n] = node_id
+
+            node_id += 1
+
+        for u, v, data in self.kg.edges(data=True):
+            text = data.get("relationship_description", "")
+
+            self.kg_level.add_node(
+                node_id,
+                text=text,
+                node_type="relationship",
+                source_entity=data.get("source_entity"),
+                target_entity=data.get("target_entity"),
+                relationship_description=data.get("relationship_description"),
+                relationship_strength=data.get("relationship_strength"),
+                chunk_id=[data.get("chunk_id")],
+            )
+
+            edge_map[(u, v)] = node_id
+
+            node_id += 1
+
+        # Now add edges between entity nodes and relationship nodes
+        for u, v, data in self.kg.edges(data=True):
+            rel_node_id = edge_map[(u, v)]
+            src_entity_node_id = node_map[u]
+            tgt_entity_node_id = node_map[v]
+
+            self.kg_level.add_edge(rel_node_id, src_entity_node_id, weight=1.0)
+            self.kg_level.add_edge(rel_node_id, tgt_entity_node_id, weight=1.0)
+
+        # Request embeddings for kg_level nodes in parallel
+        print(f"[KG Level] Obtaining embeddings in {num_workers_io} threads..." if num_workers_io is not None else "[KG Level] Obtaining embeddings in single thread...")
+        if num_workers_io is None:
+            for n, data in self.kg_level.nodes(data=True):
+                text = data.get("text", "")
+                emb = np.array(self.client.obtain_embedding(text), dtype=np.float32)
+                self.kg_level_embeddings.append(emb)
+        else:
+            texts = [data.get("text", "") for n, data in self.kg_level.nodes(data=True)]
+            with ThreadPool(num_workers_io) as pool:
+                func = partial(self.client.obtain_embedding)
+                embeddings = pool.map(func, texts)
+            for emb in embeddings:
+                emb_array = np.array(emb, dtype=np.float32)
+                self.kg_level_embeddings.append(emb_array)
+
+        assert len(self.kg_level_embeddings) == self.kg_level.number_of_nodes(), "Mismatch in KG level embeddings and nodes."
+
+        self.kg_level_embeddings = np.stack(self.kg_level_embeddings, axis=0)
+
+        return node_map, edge_map
+
+    def _add_nodes_from_kg_hierarchical_link_community(self, metadata: list[dict], chunk_embedding: np.ndarray, title_for_default_doc: str, conversation_mode: str = "kg_edge_cluster_wo_kg", num_workers_io: int = None):
         """
         Add nodes from constructed KG level.
         """
+        if conversation_mode == "kg_edge_cluster_w_kg":
+            # Add KG level graph to self.kg_level, embeddings to self.kg_level_embeddings
+            node_map, edge_map = self._add_kg_level_graph_from_kg(num_workers_io=num_workers_io)
+            print(f"[KG Level] KG level graph constructed with {self.kg_level.number_of_nodes()} nodes and {self.kg_level.number_of_edges()} edges.")
+
         # Use hierarchical link communities to detect 0-level nodes for each chunk
         N = 0
         chunk_community_map = {} # chunk_id -> list of communities (sets of edge ids)
         for chunk_id in range(len(metadata)):
             # Extract subgraph for this chunk
-            edges_in_chunk = [ (u, v) for u, v, data in self.kg_level.edges(data=True) if chunk_id == data.get("chunk_id", -1) ]
-            subgraph = self.kg_level.edge_subgraph(edges_in_chunk)
+            edges_in_chunk = [ (u, v) for u, v, data in self.kg.edges(data=True) if chunk_id == data.get("chunk_id", -1) ]
+            subgraph = self.kg.edge_subgraph(edges_in_chunk)
 
             if subgraph.number_of_nodes() == 0: # No edges in this chunk
-                nodes_in_chunk = [n for n, data in self.kg_level.nodes(data=True) if chunk_id in data.get("chunk_id")]
+                nodes_in_chunk = [n for n, data in self.kg.nodes(data=True) if chunk_id in data.get("chunk_id")]
                 communities = [set( (n_a, n_b) for n_a in nodes_in_chunk for n_b in nodes_in_chunk if n_a != n_b )]
                 N += len(communities)
                 chunk_community_map[chunk_id] = communities # len is 1
@@ -370,8 +449,8 @@ class CAM:
 
                 entity_concepts = set()
                 for n_a, n_b in comm:
-                    entity_concepts.add(self.kg_level.nodes[n_a].get("entity_name"))
-                    entity_concepts.add(self.kg_level.nodes[n_b].get("entity_name"))
+                    entity_concepts.add(self.kg.nodes[n_a].get("entity_name"))
+                    entity_concepts.add(self.kg.nodes[n_b].get("entity_name"))
                 entity_concepts = list(entity_concepts)
 
                 text = metadata[chunk_id].get("text", "")
@@ -380,14 +459,35 @@ class CAM:
 
                 embeddings.append(emb)
 
-                self.memory.add_node(
-                    i,
-                    chunk_id=chunk_id,
-                    text=text,
-                    gist=gist,
-                    entities=entity_concepts,
-                    doc_id=doc_id
-                )
+                if conversation_mode == "kg_edge_cluster_w_kg":
+                    community = set()
+                    for n_a, n_b in comm:
+                        community.add(node_map[n_a])
+                        community.add(node_map[n_b])
+                        if self.kg.has_edge(n_a, n_b) and self.kg.edges[n_a, n_b].get("chunk_id") == chunk_id:
+                            community.add(edge_map[(n_a, n_b)])
+                    community = list(community)
+
+                    self.memory.add_node(
+                        i,
+                        chunk_id=chunk_id,
+                        text=text,
+                        gist=gist,
+                        entities=entity_concepts,
+                        doc_id=doc_id,
+                        community=community
+                    )
+                elif conversation_mode == "kg_edge_cluster_wo_kg":
+                    self.memory.add_node(
+                        i,
+                        chunk_id=chunk_id,
+                        text=text,
+                        gist=gist,
+                        entities=entity_concepts,
+                        doc_id=doc_id
+                    )
+                else:
+                    raise ValueError(f"[Error] Unsupported conversation mode {conversation_mode} for KG edge cluster.")
 
                 # Add edges between communities if there are shared entities
                 ent_id_set = set()
@@ -410,22 +510,43 @@ class CAM:
             for comm in communities:
                 entity_concepts = set()
                 for n_a, n_b in comm:
-                    entity_concepts.add(self.kg_level.nodes[n_a].get("entity_name"))
-                    entity_concepts.add(self.kg_level.nodes[n_b].get("entity_name"))
+                    entity_concepts.add(self.kg.nodes[n_a].get("entity_name"))
+                    entity_concepts.add(self.kg.nodes[n_b].get("entity_name"))
                 entity_concepts = list(entity_concepts)
                 # Summarize node text & gist from member entities & relationships
                 text, emb = self._kg_community_summarization(comm, cluster_type="edge")
 
                 embeddings.append(emb)
 
-                self.memory.add_node(
-                    i,
-                    chunk_id=chunk_id,
-                    text=text,
-                    gist=text,
-                    entities=entity_concepts,
-                    doc_id=doc_id
-                )
+                if conversation_mode == "kg_edge_cluster_w_kg":
+                    community = set()
+                    for n_a, n_b in comm:
+                        community.add(node_map[n_a])
+                        community.add(node_map[n_b])
+                        if self.kg.has_edge(n_a, n_b) and self.kg.edges[n_a, n_b].get("chunk_id") == chunk_id:
+                            community.add(edge_map[(n_a, n_b)])
+                    community = list(community)
+
+                    self.memory.add_node(
+                        i,
+                        chunk_id=chunk_id,
+                        text=text,
+                        gist=text,
+                        entities=entity_concepts,
+                        doc_id=doc_id,
+                        community=community
+                    )
+                elif conversation_mode == "kg_edge_cluster_wo_kg":
+                    self.memory.add_node(
+                        i,
+                        chunk_id=chunk_id,
+                        text=text,
+                        gist=text,
+                        entities=entity_concepts,
+                        doc_id=doc_id
+                    )
+                else:
+                    raise ValueError(f"[Error] Unsupported conversation mode {conversation_mode} for KG edge cluster.")
 
                 # Add edges between communities if there are relationships between their member nodes
                 ent_id_set = set()
@@ -459,8 +580,17 @@ class CAM:
         text_sim = np.maximum(0, text_sim)
 
         # Proximity based on chunk_id (within the same doc)
-        chunk_ids = np.array([self.memory.nodes[n]['chunk_id'] for n in self.node_ids], dtype=np.int64)
-        diff = np.abs(chunk_ids[:, None] - chunk_ids[None, :])
+        if isinstance(self.memory.nodes[self.node_ids[0]]['chunk_id'], list):
+            # if chunk_id is list, take the min distance
+            chunk_ids_list = [self.memory.nodes[n]['chunk_id'] for n in self.node_ids]
+            diff = np.zeros((N, N), dtype=np.float64)
+            for i in range(N):
+                for j in range(N):
+                    dists = [abs(c1 - c2) for c1 in chunk_ids_list[i] for c2 in chunk_ids_list[j]]
+                    diff[i, j] = min(dists) if dists else np.inf
+        else:
+            chunk_ids = np.array([self.memory.nodes[n]['chunk_id'] for n in self.node_ids], dtype=np.int64)
+            diff = np.abs(chunk_ids[:, None] - chunk_ids[None, :])
         proximity_sim = np.exp(- (diff ** 2) / (2 * (self.sigma ** 2)))
         np.fill_diagonal(proximity_sim, 0.0)
 
@@ -635,17 +765,36 @@ class CAM:
             new_embs.append(emb)
         return new_texts, new_embs
 
-    def run_hierarchy(self, book_title, max_hierarchy_level: int = 10, num_workers_cpu: int = None, num_workers_io: int = None):
+    def run_hierarchy(self, book_title, max_hierarchy_level: int = 10, num_workers_cpu: int = None, num_workers_io: int = None, conversation_mode: str = "null"):
 
         self.level_graphs = []
         self.level_embeddings = []
 
-        # Level 0: current memory state
-        self._save_level_graph_and_embeddings(graph=self.memory, embeddings=self.embeddings, level=0)
+        start_level = 0
+
+        print(f"[Hierarchy] Building hierarchy for {book_title} on {conversation_mode} mode...")
+        if conversation_mode == "kg_edge_cluster_w_kg":
+            print(f"[Hierarchy] Starting from KG level for {book_title}...")
+            kg_level_community_dict = {}
+            kg_level_overlap_communities = []
+            for n in self.kg_level.nodes():
+                for comm_id, comm_nodes in self.memory.nodes(data=True):
+                    kg_level_overlap_communities.append(set(comm_nodes.get("community", [])))
+                    if n in comm_nodes.get("community", []):
+                        kg_level_community_dict.setdefault(n, []).append(comm_id)
+
+            self._print_community_stats(0, book_title, self.kg_level, kg_level_overlap_communities)
+            self._save_graph_with_community(self.kg_level, kg_level_community_dict, 0)
+            self._save_level_graph_and_embeddings(graph=self.kg_level, embeddings=self.kg_level_embeddings, level=0)
+
+            start_level = 1
+
+        # Level 0/1: current memory state
+        self._save_level_graph_and_embeddings(graph=self.memory, embeddings=self.embeddings, level=start_level)
 
         current_graph = self.memory.copy()
         prev_num_communities = current_graph.number_of_nodes()
-        level = 0
+        level = start_level
 
         while True:
             persona_graph, _, _, personality_map = self._create_persona_graph(current_graph)
@@ -818,7 +967,7 @@ class CAM:
         self._add_edges_from_similarity(sim)
 
         # Run hierarchy & compose all levels
-        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
+        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io, conversation_mode=conversation_mode)
 
     def _entity_similarity(self, ent_a_type: list[str], ent_a_emb: np.array, ent_b_type: list[str], ent_b_emb: np.array, alpha_meta: float) -> float:
         """Similarity between two entity concepts using embeddings."""
@@ -838,7 +987,7 @@ class CAM:
         return final_sim
 
     def _construct_kg(self, kg_metadata: list[dict]):
-        kg_level = nx.Graph()
+        kg = nx.Graph()
 
         ent_embs = []
         ent_list = []
@@ -881,10 +1030,10 @@ class CAM:
                     if linked_id != -1 and sim_max >= 0.85:
                         # Link to existing entity
                         # print(f"[KG] Linking entity '{ent['entity_name']}' in chunk {chunk_id} to existing entity id {linked_id} '{ent_list[linked_id]['entity_name']}' (sim={sim_max:.4f}).")
-                        kg_level.nodes[linked_id]['chunk_id'].append(chunk_id)
+                        kg.nodes[linked_id]['chunk_id'].append(chunk_id)
                         ent_id_map[key] = linked_id
-                        # print(f"[KG] Updated node {linked_id} chunk_id list: {kg_level.nodes[linked_id]['chunk_id']}.")
-                        # print(f"[KG] After linking, ent_list size: {len(ent_list)}. node number: {kg_level.number_of_nodes()}.")
+                        # print(f"[KG] Updated node {linked_id} chunk_id list: {kg.nodes[linked_id]['chunk_id']}.")
+                        # print(f"[KG] After linking, ent_list size: {len(ent_list)}. node number: {kg.number_of_nodes()}.")
                     else:
                         linked_id = -1
                         ent_id_map[key] = ent_id
@@ -892,14 +1041,14 @@ class CAM:
                     if linked_id == -1:
                         # Add new entity node
                         # print(f"[KG] Adding new entity '{ent['entity_name']}' in chunk {chunk_id} as entity id {ent_id}.")
-                        kg_level.add_node(ent_id,
+                        kg.add_node(ent_id,
                                           chunk_id=[chunk_id],
                                           entity_name=ent['entity_name'],
                                           entity_description=ent['entity_description'],
                                           entity_type=ent.get('entity_type', []))
                         ent_embs.append(emb)
                         ent_list.append(ent)
-                        # print(f"[KG] ent_list size: {len(ent_list)}. node number: {kg_level.number_of_nodes()}.")
+                        # print(f"[KG] ent_list size: {len(ent_list)}. node number: {kg.number_of_nodes()}.")
                         ent_id += 1
 
             for rel in relations:
@@ -913,7 +1062,7 @@ class CAM:
                     # print(f"[KG] Adding edge between '{rel['source_entity']}' and '{rel['target_entity']}' with strength {safe_rel_strength:.4f}.")
                     source_id = ent_id_map[source_key]
                     target_id = ent_id_map[target_key]
-                    kg_level.add_edge(source_id, target_id,
+                    kg.add_edge(source_id, target_id,
                                       source_entity=rel['source_entity'],
                                       target_entity=rel['target_entity'],
                                       relationship_description=rel_description,
@@ -922,7 +1071,7 @@ class CAM:
                     # print(f"[KG] Edge added between node {source_id} and node {target_id}.")
 
         # assert 0, "Debug stop"
-        return kg_level
+        return kg
 
     def build_memory_kg(self,
                         book_title,
@@ -941,27 +1090,37 @@ class CAM:
         if conversation_mode is not None:
             # Construct KG level
             print(f"[KG] Constructing knowledge graph level for {book_title}...")
-            self.kg_level = self._construct_kg(kg_metadata)
-            print(f"[KG] KG constructed for {book_title}: nodes={self.kg_level.number_of_nodes()}, edges={self.kg_level.number_of_edges()}.")
-            if conversation_mode in ['kg', 'kg_node_cluster_wo_kg']:
+            self.kg = self._construct_kg(kg_metadata)
+            print(f"[KG] KG constructed for {book_title}: nodes={self.kg.number_of_nodes()}, edges={self.kg.number_of_edges()}.")
+            if conversation_mode in ['kg_node_cluster_wo_kg']:
                 kg_community_embeddings = self._add_nodes_from_kg_leiden(metadata, chunk_embedding=embeddings, title_for_default_doc=book_title)
-            elif conversation_mode in ['kg_edge_cluster_wo_kg']:
-                kg_community_embeddings = self._add_nodes_from_kg_hierarchical_link_community(metadata, chunk_embedding=embeddings, title_for_default_doc=book_title)
+                self.embeddings = np.atleast_2d(kg_community_embeddings).astype(np.float32)
+            elif conversation_mode in ['kg_edge_cluster_wo_kg', 'kg_edge_cluster_w_kg']:
+                kg_community_embeddings = self._add_nodes_from_kg_hierarchical_link_community(metadata, chunk_embedding=embeddings, title_for_default_doc=book_title, conversation_mode=conversation_mode, num_workers_io=num_workers_io)
+                self.embeddings = np.atleast_2d(kg_community_embeddings).astype(np.float32)
+            elif conversation_mode in ['kg']:
+                node_map, edge_map = self._add_kg_level_graph_from_kg(num_workers_io=num_workers_io)
+                self.memory = self.kg_level.copy()
+                self.embeddings = np.atleast_2d(self.kg_level_embeddings.copy()).astype(np.float32)
+                self.node_ids = list(range(self.memory.number_of_nodes()))
+                self.doc_ids = [self.memory.nodes[n].get("doc_id") for n in self.node_ids] # TODO: Need to ensure in future
             else:
                 raise ValueError(f"[Error] Unknown conversation_mode for KG: {conversation_mode}")
-            print(f"[KG] KG communities for {book_title} added as level-0 nodes: total nodes={len(self.node_ids)}.")
-            self.embeddings = np.atleast_2d(kg_community_embeddings).astype(np.float32)
+            print(f"[KG] KG communities for {book_title} added as level-0/1 nodes: total nodes={len(self.node_ids)}.")
+
         else:
             self._add_nodes_from_metadata(metadata, title_for_default_doc=book_title)
             self.embeddings = np.atleast_2d(embeddings).astype(np.float32)
         self.doc_mask = doc_mask  # None for single-doc; (N,N) for multi-doc
 
         # Build edges from pairwise similarity for level-0
+        print(f"[KG] Building pairwise similarity for level-0/1 of {book_title}...")
         sim = self._build_pairwise_similarity()
+        print(f"[KG] Adding edges from similarity for level-0/1 of {book_title}...")
         self._add_edges_from_similarity(sim)
 
         # Run hierarchy & compose all levels
-        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io)
+        self.run_hierarchy(book_title, max_hierarchy_level=max_hierarchy_level, num_workers_cpu=num_workers_cpu, num_workers_io=num_workers_io, conversation_mode=conversation_mode)
 
 
 def load_json(fp: str):
@@ -1019,7 +1178,7 @@ def single_doc_worker(filename,
     # Only 'statement' mode needs special handling here
     safe_conversation_mode = None
     stmt_modes = ['statement']
-    kg_modes = ['kg', 'kg_node_cluster_wo_kg', 'kg_edge_cluster_wo_kg']
+    kg_modes = ['kg', 'kg_node_cluster_wo_kg', 'kg_edge_cluster_wo_kg', 'kg_edge_cluster_w_kg']
     if conversation_mode in stmt_modes + kg_modes:
         safe_conversation_mode = conversation_mode
 
